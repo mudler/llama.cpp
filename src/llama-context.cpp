@@ -4,10 +4,13 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
+
+#include "ggml-turbo-quant.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -2168,6 +2171,19 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    // Set TurboQuant thread-local context if KV cache uses TBQ types
+    if (memory) {
+        auto * kv = dynamic_cast<llama_kv_cache *>(memory.get());
+        if (kv) {
+            // Set whichever TQ context is available (K and V share the same dim typically)
+            if (kv->tq_ctx_k) {
+                turbo_quant_set_ctx(kv->tq_ctx_k);
+            } else if (kv->tq_ctx_v) {
+                turbo_quant_set_ctx(kv->tq_ctx_v);
+            }
+        }
+    }
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
