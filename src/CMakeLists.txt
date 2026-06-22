@@ -27,6 +27,7 @@ add_library(llama
             paged-kv-manager.cpp
             paged-attn.cpp
             paged-alloc.cpp
+            paged-prefix-api.cpp
             llama-kv-cache-dsa.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp

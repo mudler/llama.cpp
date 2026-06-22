@@ -199,6 +199,14 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // [paged 0007] Cross-request prefix recompute-skip (experimental, gated by
+    // env LLAMA_KV_PAGED). paged_prefix_share() reuses a cached content prefix
+    // for seq_id and returns the number of shared prefix tokens (the caller
+    // decodes only the suffix); paged_prefix_commit() publishes a sequence into
+    // the content cache for later reuse. No-ops when LLAMA_KV_PAGED is unset.
+    int32_t paged_prefix_share (llama_seq_id seq_id, const std::vector<llama_token> & tokens);
+    void    paged_prefix_commit(llama_seq_id seq_id, const std::vector<llama_token> & tokens);
+
     //
     // input API
     //

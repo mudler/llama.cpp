@@ -419,7 +419,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // removed (sequence end), so they return to the pool for reuse.
     if (paged_alloc::active() && p0 == 0 && p1 == std::numeric_limits<llama_pos>::max()) {
         if (seq_id >= 0) {
-            paged_alloc::release(this, (int) seq_to_stream[seq_id]);
+            paged_alloc::release(this, (int) seq_to_stream[seq_id], (int) seq_id);
         } else {
             paged_alloc::release_all(this);
         }
@@ -1056,10 +1056,15 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             const uint32_t bs   = 16;                 // block size (tokens/block)
             const uint32_t nblk = cells.size() / bs;  // this stream's block budget
             if (nblk >= 2) {
-                const uint32_t base = cells.get_used();
+                // [paged 0007] Anchor placement on this sequence's own logical
+                // base position (ubatch.pos), not the shared used-count, and key
+                // the manager request by the real seq_id. slot(seq,pos) is then
+                // stable per sequence, so an independently-freed (ref-counted)
+                // sequence and a shared prefix can coexist in one unified pool.
+                const uint32_t base = (uint32_t) ubatch.pos[s*n_tokens];
                 const int      strm = (int) seq_to_stream[seq_id];
                 std::vector<uint32_t> placed;
-                if (paged_alloc::place(this, strm, base, n_tokens, bs, nblk, placed)) {
+                if (paged_alloc::place(this, strm, (int) seq_id, base, n_tokens, bs, nblk, placed)) {
                     bool ok = (placed.size() == n_tokens);
                     for (uint32_t i = 0; ok && i < n_tokens; ++i) {
                         if (placed[i] >= cells.size() || !cells.is_empty(placed[i])) {
@@ -1163,6 +1168,61 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     assert(res.s1 >= res.s0);
 
     return res;
+}
+
+// [paged 0007] Cross-request prefix recompute-skip.
+//
+// Reuse a cached content prefix for seq_id: share_prefix() splices the longest
+// matching cached physical blocks into seq_id (ref_cnt++) and reserves fresh
+// blocks for the divergent suffix. We then mark the shared physical cells as
+// belonging to seq_id - those cells already hold the owner's computed KV at the
+// matching logical positions, so the caller decodes ONLY the suffix and the
+// prefix is never recomputed. Returns the number of shared prefix tokens.
+// Gated behind LLAMA_KV_PAGED; a no-op (returns 0) otherwise.
+int32_t llama_kv_cache::paged_prefix_share(llama_seq_id seq_id, const std::vector<llama_token> & tokens) {
+    if (!paged_alloc::active() || tokens.empty()) {
+        return 0;
+    }
+    const uint32_t bs   = 16;
+    const uint32_t strm = (uint32_t) seq_to_stream[seq_id];
+    auto & cells = v_cells[strm];
+    const uint32_t nblk = cells.size() / bs;
+    if (nblk < 2) {
+        return 0;
+    }
+
+    std::vector<int> toks(tokens.begin(), tokens.end());
+    const size_t kshare = paged_alloc::share_prefix(this, (int) strm, (int) seq_id, toks, bs, nblk);
+
+    for (size_t p = 0; p < kshare; ++p) {
+        const int64_t cell = paged_alloc::slot(this, (int) strm, (int) seq_id, (int) p);
+        if (cell < 0 || (uint32_t) cell >= cells.size() ||
+            cells.is_empty((uint32_t) cell) ||
+            cells.pos_get((uint32_t) cell) != (llama_pos) p) {
+            // Owner cell missing / repurposed: cannot safely share. Roll the
+            // sequence back so the caller recomputes the whole prompt.
+            paged_alloc::release(this, (int) strm, (int) seq_id);
+            return 0;
+        }
+        if (!cells.seq_has((uint32_t) cell, seq_id)) {
+            cells.seq_add((uint32_t) cell, seq_id);
+        }
+    }
+    return (int32_t) kshare;
+}
+
+// [paged 0007] Publish a sequence's full blocks into the content cache so a
+// later paged_prefix_share() can reuse them. Call after the sequence KV is
+// computed (its prefill decode has run).
+void llama_kv_cache::paged_prefix_commit(llama_seq_id seq_id, const std::vector<llama_token> & tokens) {
+    if (!paged_alloc::active() || tokens.empty()) {
+        return;
+    }
+    const uint32_t bs   = 16;
+    const uint32_t strm = (uint32_t) seq_to_stream[seq_id];
+    const uint32_t nblk = v_cells[strm].size() / bs;
+    std::vector<int> toks(tokens.begin(), tokens.end());
+    paged_alloc::commit(this, (int) strm, (int) seq_id, toks, bs, nblk);
 }
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
