@@ -15,6 +15,7 @@
 #include <vector>
 #include <unordered_map>
 #include <map>
+#include <utility>
 
 namespace paged {
 
@@ -99,6 +100,28 @@ public:
     std::vector<uint64_t> compute_block_hashes(const std::vector<int>& token_ids) const;
     size_t get_computed_blocks(const std::vector<uint64_t>& block_hashes); // returns num cached tokens
     void cache_blocks(int seq_id, const std::vector<uint64_t>& block_hashes, size_t num_tokens);
+
+    // Cross-request prefix caching + copy-on-write (patch 0006).
+    //
+    // Splice the longest cached prefix of token_ids into seq_id (reuse the
+    // shared physical blocks, ref_cnt++ so a block frees only at ref 0) and
+    // allocate fresh blocks only for the divergent suffix. Returns the number of
+    // shared (reused) blocks; the caller skips recomputing those tokens. On pool
+    // exhaustion the sequence is rolled back (no ref leak) and 0 is returned.
+    size_t place_with_prefix(int seq_id, const std::vector<int>& token_ids);
+
+    // Copy-on-write the block at logical index bi of seq_id. If that block is
+    // shared (ref_cnt>1), allocate a fresh private block, drop this seq's ref on
+    // the shared one (other owners keep it, content untouched) and install the
+    // fresh block at bi. Returns {old_block_id, new_block_id}; new==old when the
+    // block was already private (ref_cnt<=1) and no copy is needed. The caller
+    // copies the physical cell contents old_block_id -> new_block_id.
+    std::pair<int32_t, int32_t> cow_block(int seq_id, size_t bi);
+
+    // Introspection for the prefix-share gate (debug/tests).
+    int    block_ref_cnt_at(int seq_id, size_t bi) const;
+    size_t num_blocks(int seq_id) const;
+    size_t num_free_blocks() const { return pool_.get_num_free_blocks(); }
 
 protected:
     int block_size_;

@@ -293,4 +293,69 @@ void PagedKVManager::cache_blocks(int seq_id, const std::vector<uint64_t>& block
     pool_.cache_full_blocks(req, /*num_cached=*/0, n_full, block_hashes);
 }
 
+// ---------------------------------------------------------------------------
+// Cross-request prefix caching + copy-on-write  (patch 0006)
+// ---------------------------------------------------------------------------
+
+size_t PagedKVManager::place_with_prefix(int seq_id, const std::vector<int>& token_ids) {
+    auto& req = req_to_blocks_[seq_id];
+
+    // Longest cached prefix: hash the full blocks and stop at the first miss.
+    // A block hash transitively encodes its whole prefix (FNV chaining), so the
+    // first miss bounds the reusable prefix (vLLM find_longest_cache_hit).
+    const std::vector<uint64_t> hashes = compute_block_hashes(token_ids);
+    std::vector<KVCacheBlock*> hits;
+    for (uint64_t bh : hashes) {
+        KVCacheBlock* cb = pool_.get_cached_block(bh);
+        if (!cb) break;
+        hits.push_back(cb);
+    }
+
+    // Reuse: ++ref_cnt (pulling warm blocks back out of the free list) then
+    // splice the shared physical blocks into this sequence's block table.
+    pool_.touch(hits);
+    req.insert(req.end(), hits.begin(), hits.end());
+
+    // Allocate fresh blocks only for the divergent suffix.
+    const size_t need = cdiv(token_ids.size(), block_size_);
+    if (need > req.size()) {
+        const size_t add = need - req.size();
+        if (add > pool_.get_num_free_blocks()) {
+            // OOM: roll the sequence back (un-touch the shared prefix so no ref
+            // leaks) and report no placement; the caller falls back to stock.
+            std::vector<KVCacheBlock*> ordered(req.rbegin(), req.rend());
+            pool_.free_blocks(ordered);
+            req.clear();
+            return 0;
+        }
+        auto nb = pool_.get_new_blocks(add);
+        req.insert(req.end(), nb.begin(), nb.end());
+    }
+    return hits.size();
+}
+
+std::pair<int32_t, int32_t> PagedKVManager::cow_block(int seq_id, size_t bi) {
+    auto& req = req_to_blocks_.at(seq_id);
+    KVCacheBlock* old = req.at(bi);
+    if (old->ref_cnt <= 1) {
+        return { old->block_id, old->block_id }; // already private - no copy
+    }
+    // Private copy for this sequence. get_new_blocks sets the fresh block's
+    // ref_cnt to 1; free_blocks decrements the shared block, which stays >0 so
+    // it is NOT returned to the pool and the other owners are left untouched.
+    KVCacheBlock* fresh = pool_.get_new_blocks(1).front();
+    pool_.free_blocks({ old });
+    req[bi] = fresh;
+    return { old->block_id, fresh->block_id };
+}
+
+int PagedKVManager::block_ref_cnt_at(int seq_id, size_t bi) const {
+    return req_to_blocks_.at(seq_id).at(bi)->ref_cnt;
+}
+
+size_t PagedKVManager::num_blocks(int seq_id) const {
+    auto it = req_to_blocks_.find(seq_id);
+    return it == req_to_blocks_.end() ? 0 : it->second.size();
+}
+
 } // namespace paged
