@@ -17,6 +17,16 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+// [paged 0008] Cross-request prefix recompute-skip shim. share()/commit() are
+// defined in libllama (src/paged-prefix-api.cpp, patch 0007) and are no-ops
+// unless env LLAMA_KV_PAGED is set. Declared here so the paged cross-slot prefix
+// cache wires into update_slots() without pulling in internal kv-cache headers.
+// Fully gated; stock (paged off) is byte-identical.
+namespace paged_prefix_api {
+    int32_t share (llama_context * ctx, llama_seq_id seq, const llama_token * tokens, int n);
+    void    commit(llama_context * ctx, llama_seq_id seq, const llama_token * tokens, int n);
+}
+
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
@@ -3336,6 +3346,37 @@ private:
                             }
                         }
 
+                        // [paged 0008] Cross-request prefix recompute-skip. The native prompt cache
+                        // above only reuses THIS slot's own prior prompt; when the paged KV
+                        // engine is active, also reuse a committed CROSS-slot prefix so
+                        // concurrent requests sharing a long prefix skip recompute. Gated on
+                        // LLAMA_KV_PAGED (paged_kv_share static); stock stays byte-identical.
+                        static const bool paged_kv_share = getenv("LLAMA_KV_PAGED") != nullptr;
+                        // Only attempt the cross-request share on a FRESH slot (the native
+                        // cache above did not already cover the prefix). With n_past < a
+                        // block, any block-aligned share the engine returns is strictly
+                        // larger than n_past and is therefore always adopted below - so the
+                        // engine's full-prompt reservation always matches the suffix-only
+                        // submission and never leaves stale blocks (which fragmented the
+                        // paged pool and crashed the server under high fan-out otherwise).
+                        if (paged_kv_share && n_past < 16 && slot.task->params.cache_prompt && !input_tokens.has_mtmd) {
+                            const llama_tokens ptoks = input_tokens.get_text_tokens();
+                            // Drop this slot's own cells beyond the natively-cached prefix before
+                            // splicing the shared physical prefix in, so the shared cells can own
+                            // [n_past, kshare) without colliding (the native path removes exactly
+                            // these later; a no-op for a fresh slot).
+                            common_context_seq_rm(ctx_tgt, slot.id, n_past, -1);
+                            const int32_t kshare = paged_prefix_api::share(ctx_tgt, slot.id, ptoks.data(), (int) ptoks.size());
+                            if (kshare > n_past) {
+                                slot.prompt.tokens.keep_first(n_past);
+                                for (int i = n_past; i < kshare; ++i) {
+                                    slot.prompt.tokens.push_back(ptoks[i]);
+                                }
+                                n_past = kshare;
+                                SLT_INF(slot, "paged: reusing %d cross-request shared prefix tokens - not recomputed\n", n_past);
+                            }
+                        }
+
                         // [TAG_PROMPT_LOGITS]
                         if (n_past == slot.task->n_tokens() && n_past > 0) {
                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
@@ -3741,6 +3782,15 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // [paged 0008] Publish this slot's computed prefix so concurrent/later
+                // slots can share it (no-op unless LLAMA_KV_PAGED). The prefill decode
+                // for [0, n_tokens) has just run, so the prefix KV is computed.
+                static const bool paged_kv_commit = getenv("LLAMA_KV_PAGED") != nullptr;
+                if (paged_kv_commit && slot.task->params.cache_prompt && !slot.prompt.tokens.has_mtmd) {
+                    const llama_tokens ctoks = slot.prompt.tokens.get_text_tokens();
+                    paged_prefix_api::commit(ctx_tgt, slot.id, ctoks.data(), (int) ctoks.size());
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
