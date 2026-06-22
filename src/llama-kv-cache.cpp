@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "paged-alloc.h"
 #include <vector>
 #include <utility>
 
@@ -381,6 +382,11 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    // [paged 0004] return all on-demand blocks to the pool on cache clear.
+    if (paged_alloc::active()) {
+        paged_alloc::release_all(this);
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -407,6 +413,16 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
     if (p1 < 0) {
         p1 = std::numeric_limits<llama_pos>::max();
+    }
+
+    // [paged 0004] free a stream's on-demand blocks when its whole sequence is
+    // removed (sequence end), so they return to the pool for reuse.
+    if (paged_alloc::active() && p0 == 0 && p1 == std::numeric_limits<llama_pos>::max()) {
+        if (seq_id >= 0) {
+            paged_alloc::release(this, (int) seq_to_stream[seq_id]);
+        } else {
+            paged_alloc::release_all(this);
+        }
     }
 
     if (seq_id >= 0) {
@@ -1030,36 +1046,39 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         // the correctness premise of paged attention. Enabled via LLAMA_KV_PAGED.
         // Single-sequence scope (uses get_used() as the logical base); falls back
         // to the normal allocator if the permuted cells aren't available.
-        static const bool paged_mode = (std::getenv("LLAMA_KV_PAGED") != nullptr);
-        if (paged_mode) {
+        // [paged 0004] On-demand block allocation. Patch 0002 proved attention is
+        // invariant to physical KV placement; here that placement is driven by
+        // the vendored PagedKVManager (patch 0001): blocks are popped from a free
+        // pool only as the sequence crosses block boundaries (peak << full
+        // reservation) and returned on sequence end. Enabled via LLAMA_KV_PAGED;
+        // falls back to the normal allocator on pool exhaustion or any conflict.
+        if (paged_alloc::active()) {
             const uint32_t bs   = 16;                 // block size (tokens/block)
-            const uint32_t nblk = cells.size() / bs;  // blocks in this stream's pool
+            const uint32_t nblk = cells.size() / bs;  // this stream's block budget
             if (nblk >= 2) {
-                // stride coprime to nblk => block-index permutation is a bijection
-                uint32_t k = 1;
-                for (uint32_t cand = (nblk / 2) | 1u; cand < nblk; cand += 2) {
-                    if (std::gcd(cand, nblk) == 1u) { k = cand; break; }
-                }
                 const uint32_t base = cells.get_used();
-                bool ok = true;
-                for (uint32_t i = 0; i < n_tokens; ++i) {
-                    const uint32_t L    = base + i;
-                    const uint32_t b    = L / bs;
-                    const uint32_t off  = L % bs;
-                    if (b >= nblk) { ok = false; break; }
-                    const uint32_t phys = ((b * k) % nblk) * bs + off; // permuted block
-                    if (phys >= cells.size() || !cells.is_empty(phys)) { ok = false; break; }
-                    res.idxs[s].push_back(phys);
-                }
-                if (ok && res.idxs[s].size() == n_tokens) {
-                    if (std::getenv("LLAMA_KV_PAGED_DEBUG")) {
-                        fprintf(stderr, "[paged] seq placed %u tok at cells:", n_tokens);
-                        for (uint32_t z = 0; z < res.idxs[s].size() && z < 24; ++z) fprintf(stderr, " %u", res.idxs[s][z]);
-                        fprintf(stderr, " (k=%u nblk=%u base=%u)\n", k, nblk, base);
+                const int      strm = (int) seq_to_stream[seq_id];
+                std::vector<uint32_t> placed;
+                if (paged_alloc::place(this, strm, base, n_tokens, bs, nblk, placed)) {
+                    bool ok = (placed.size() == n_tokens);
+                    for (uint32_t i = 0; ok && i < n_tokens; ++i) {
+                        if (placed[i] >= cells.size() || !cells.is_empty(placed[i])) {
+                            ok = false;
+                        }
                     }
-                    continue; // paged placement succeeded for this sequence
+                    if (ok) {
+                        for (uint32_t phys : placed) {
+                            res.idxs[s].push_back(phys);
+                        }
+                        if (std::getenv("LLAMA_KV_PAGED_DEBUG")) {
+                            fprintf(stderr, "[paged] stream %d placed %u tok at cells:", strm, n_tokens);
+                            for (uint32_t z = 0; z < res.idxs[s].size() && z < 24; ++z) fprintf(stderr, " %u", res.idxs[s][z]);
+                            fprintf(stderr, " (nblk=%u base=%u)\n", nblk, base);
+                        }
+                        continue; // on-demand paged placement succeeded
+                    }
+                    res.idxs[s].clear(); // fall back to the normal allocator
                 }
-                res.idxs[s].clear(); // fall back to the normal allocator
             }
         }
 
