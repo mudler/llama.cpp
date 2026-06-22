@@ -1,4 +1,6 @@
 #include "llama-kv-cache.h"
+#include <vector>
+#include <utility>
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -1329,6 +1331,70 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
+// [paged 0003] gather-read: enumerate the non-empty cells in [0, n_kv) for the
+// single stream addressed by sinfo. With paged placement (patch 0002) these are
+// the sequence's scattered block cells; gathering K/V/mask by this index list
+// compacts the attention read while preserving every unmasked (token,cell) pair.
+uint32_t llama_kv_cache::get_n_gather(uint32_t n_kv, const slot_info & sinfo) const {
+    // Multi-stream: the gathered K/V/mask tensors are rectangular [.., n_gather,
+    // n_stream], so n_gather is the MAX non-empty count across the batch streams.
+    // Streams with fewer cells are padded (see get_gather_idxs) with a masked
+    // (empty) cell index, which contributes exp(-inf)=0 and is thus a no-op.
+    // K is laid out over physical streams [s0, s1]; index v_cells the same way.
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    uint32_t mx = 0;
+    for (uint32_t j = 0; j < ns; ++j) {
+        const auto & cells = v_cells[sinfo.s0 + j];
+        const uint32_t n = std::min<uint32_t>(n_kv, cells.size());
+        uint32_t cnt = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!cells.is_empty(i)) {
+                ++cnt;
+            }
+        }
+        mx = std::max(mx, cnt);
+    }
+    return mx;
+}
+
+void llama_kv_cache::get_gather_idxs(int32_t * dst, uint32_t n_kv, const slot_info & sinfo) const {
+    const uint32_t ns       = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t n_gather = get_n_gather(n_kv, sinfo);
+    // dst is [n_gather, n_stream] (ne0 = n_gather): column s at dst[s*n_gather..].
+    for (uint32_t j = 0; j < ns; ++j) {
+        const auto & cells = v_cells[sinfo.s0 + j];
+        const uint32_t n = std::min<uint32_t>(n_kv, cells.size());
+        // Collect the non-empty cells, then order them by token POSITION (not by
+        // physical cell index). The attention reduction (flash-attn online
+        // softmax, and the non-flash soft_max) runs over cells in array order and
+        // is order-sensitive in floating point. Stock (contiguous) placement
+        // happens to store cells in position order, so emitting the gathered
+        // indices in position order reproduces stock's exact reduction order -
+        // making the paged read bit-identical, not merely math-equivalent.
+        std::vector<std::pair<llama_pos, int32_t>> pc;
+        pc.reserve(n);
+        int32_t pad = -1;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!cells.is_empty(i)) {
+                pc.emplace_back(cells.pos_get(i), (int32_t) i);
+            } else if (pad < 0) {
+                pad = (int32_t) i; // first empty cell: its mask is -inf -> safe pad
+            }
+        }
+        std::sort(pc.begin(), pc.end());
+        int32_t * col = dst + (size_t) j * n_gather;
+        for (size_t k = 0; k < pc.size(); ++k) {
+            col[k] = pc[k].second;
+        }
+        // Pad the tail to n_gather with a masked (empty) cell so the rectangular
+        // gather drops to zero contribution for streams shorter than the max.
+        const int32_t padv = (pad >= 0) ? pad : (pc.empty() ? 0 : pc.back().second);
+        for (uint32_t k = (uint32_t) pc.size(); k < n_gather; ++k) {
+            col[k] = padv;
+        }
+    }
+}
+
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -2618,6 +2684,14 @@ ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) cons
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+uint32_t llama_kv_cache_context::get_n_gather() const {
+    return kv->get_n_gather(n_kv, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::get_gather_idxs(int32_t * dst) const {
+    kv->get_gather_idxs(dst, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

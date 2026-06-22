@@ -171,6 +171,12 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // [paged 0003] count / list the non-empty cells in [0, n_kv) per stream of
+    //   sinfo (position-sorted, padded across streams). Used by paged-attn
+    //   gather-read. get_n_gather returns the max count across streams.
+    uint32_t get_n_gather(uint32_t n_kv, const slot_info & sinfo) const;
+    void     get_gather_idxs(int32_t * dst, uint32_t n_kv, const slot_info & sinfo) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -367,6 +373,11 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // [paged 0003] gather-read helpers (delegate to the kv cache for the
+    //   current ubatch's stream).
+    uint32_t get_n_gather() const;
+    void     get_gather_idxs(int32_t * dst) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

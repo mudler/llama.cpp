@@ -6,6 +6,8 @@
 #include "llama-cparams.h"
 
 #include "llama-kv-cache.h"
+
+#include "paged-attn.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-memory-hybrid.h"
@@ -2356,7 +2358,12 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    // [paged 0003] gather K, V and the mask to the sequence's used cells only
+    //   (no-op unless env LLAMA_KV_PAGED is set).
+    ggml_tensor * kq_mask_g = kq_mask;
+    paged_attn::gather(ctx0, res, mctx_cur, &k, &v, &kq_mask_g);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_g, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
