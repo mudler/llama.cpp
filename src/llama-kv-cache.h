@@ -176,6 +176,9 @@ public:
     //   gather-read. get_n_gather returns the max count across streams.
     uint32_t get_n_gather(uint32_t n_kv, const slot_info & sinfo) const;
     void     get_gather_idxs(int32_t * dst, uint32_t n_kv, const slot_info & sinfo) const;
+    // [paged inc1] block table [n_blk, n_stream] (position order, padded to n_blk
+    //   per column with a masked empty cell) for the in-kernel paged read.
+    void     get_block_table(int32_t * dst, uint32_t n_blk, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -386,6 +389,7 @@ public:
     //   current ubatch's stream).
     uint32_t get_n_gather() const;
     void     get_gather_idxs(int32_t * dst) const;
+    void     get_block_table(int32_t * dst, uint32_t n_blk) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

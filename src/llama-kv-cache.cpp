@@ -1474,6 +1474,33 @@ void llama_kv_cache::get_gather_idxs(int32_t * dst, uint32_t n_kv, const slot_in
     }
 }
 
+void llama_kv_cache::get_block_table(int32_t * dst, uint32_t n_blk, uint32_t n_kv, const slot_info & sinfo) const {
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    for (uint32_t j = 0; j < ns; ++j) {
+        const auto & cells = v_cells[sinfo.s0 + j];
+        const uint32_t n = std::min<uint32_t>(n_kv, cells.size());
+        std::vector<std::pair<llama_pos, int32_t>> pc;
+        pc.reserve(n);
+        int32_t pad = -1;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!cells.is_empty(i)) {
+                pc.emplace_back(cells.pos_get(i), (int32_t) i);
+            } else if (pad < 0) {
+                pad = (int32_t) i;
+            }
+        }
+        std::sort(pc.begin(), pc.end());
+        int32_t * col = dst + (size_t) j * n_blk;
+        for (size_t k = 0; k < pc.size(); ++k) {
+            col[k] = pc[k].second;
+        }
+        const int32_t padv = (pad >= 0) ? pad : (pc.empty() ? 0 : pc.back().second);
+        for (uint32_t k = (uint32_t) pc.size(); k < n_blk; ++k) {
+            col[k] = padv;
+        }
+    }
+}
+
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -2771,6 +2798,10 @@ uint32_t llama_kv_cache_context::get_n_gather() const {
 
 void llama_kv_cache_context::get_gather_idxs(int32_t * dst) const {
     kv->get_gather_idxs(dst, n_kv, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::get_block_table(int32_t * dst, uint32_t n_blk) const {
+    kv->get_block_table(dst, n_blk, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

@@ -8357,6 +8357,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * block_table = dst->src[5]; // [paged] logical->physical cell map (src[5])
+    const int32_t     * bt    = block_table ? (const int32_t *) block_table->data : nullptr;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8476,7 +8478,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             float s; // KQ value
 
-            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            // [paged] map the logical KV index ic to its physical cell via the block table.
+            const int64_t ic_phys = bt ? (int64_t) bt[ik3*nek1 + ic] : ic;
+            const char * k_data = (const char *) k->data + ( ic_phys*nbk1 + ik2*nbk2 + ik3*nbk3);
             kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
 
             s = s*scale; // scale KQ value
@@ -8492,7 +8496,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+            const char * v_data = ((const char *) v->data + (ic_phys*nbv1 + iv2*nbv2 + iv3*nbv3));
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
@@ -9048,7 +9052,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && dst->src[5] == nullptr && // [paged] one_chunk honors the block table
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&

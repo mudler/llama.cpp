@@ -2427,6 +2427,12 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // [paged] optional block table in src[5]: I32 [n_kv_logical, n_stream]; maps each
+    // logical KV index to the physical cell within K/V. nullptr => stock contiguous read.
+    GGML_API void ggml_flash_attn_ext_set_block_table(
+            struct ggml_tensor * a,
+            struct ggml_tensor * block_table);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

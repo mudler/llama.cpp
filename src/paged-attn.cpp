@@ -43,6 +43,25 @@ public:
     ggml_tensor * idxs;
 };
 
+// Block table filler for the in-kernel paged read: fills an I32 [n_blk, n_stream]
+// tensor with each stream's position-ordered cells, padded to n_blk (per column)
+// with a masked empty cell, by delegating to the kv-cache context.
+class input_block_table : public llm_graph_input_i {
+public:
+    input_block_table(const llama_kv_cache_context * mctx, ggml_tensor * idxs, uint32_t n_blk)
+        : mctx(mctx), idxs(idxs), n_blk(n_blk) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        GGML_ASSERT(idxs && ggml_backend_buffer_is_host(idxs->buffer));
+        mctx->get_block_table((int32_t *) idxs->data, n_blk);
+    }
+
+    const llama_kv_cache_context * mctx;
+    ggml_tensor * idxs;
+    uint32_t n_blk;
+};
+
 } // namespace
 
 void gather(ggml_context * ctx0,
@@ -123,6 +142,94 @@ void gather(ggml_context * ctx0,
         }
         *kq_mask = m;
     }
+}
+
+bool in_kernel_decode(ggml_context * ctx0,
+                      llm_graph_result * res,
+                      const llama_kv_cache_context * mctx,
+                      ggml_tensor ** k,
+                      ggml_tensor ** v,
+                      ggml_tensor ** kq_mask,
+                      ggml_tensor ** block_table) {
+    if (!active()) {
+        return false;
+    }
+    // Bench escape hatch: LLAMA_KV_PAGED_GATHER=1 forces the old gather-read decode
+    // path (for a same-build BEFORE/AFTER decode-step comparison). Dev-only.
+    static const bool force_gather = (std::getenv("LLAMA_KV_PAGED_GATHER") != nullptr);
+    if (force_gather) {
+        return false;
+    }
+
+    ggml_tensor * K = *k;
+    ggml_tensor * V = *v;
+    ggml_tensor * M = *kq_mask;
+
+    const int64_t n_stream = K->ne[3];
+    GGML_ASSERT(M->ne[3] == n_stream);
+
+    const int64_t n_gather = (int64_t) mctx->get_n_gather();
+    if (n_gather <= 0) {
+        // Worst-case reserve / nothing placed yet: keep the dense [0,n_kv) read.
+        return false;
+    }
+
+    // The in-kernel read addresses V along its d-major (non-transposed) axis. If
+    // the cache stores V transposed, fall back to gather() (which normalizes it).
+    if (V->nb[1] > V->nb[2]) {
+        return false;
+    }
+
+    if (debug()) {
+        static int64_t once = 0;
+        if (once++ < 2) {
+            fprintf(stderr, "[paged-attn] in-kernel decode n_stream=%lld n_kv=%lld n_gather=%lld\n",
+                    (long long) n_stream, (long long) K->ne[2], (long long) n_gather);
+        }
+    }
+
+    // Block table [n_gather, n_stream]: column s holds stream s's non-empty cells
+    // in token-POSITION order (identical to the gather index, so the reduction
+    // order matches stock bit-for-bit), padded with a masked empty cell. Filled
+    // at set_input from the kv-cache (get_gather_idxs), exactly like the gather.
+    // Pad the logical length to FATTN_KQ_STRIDE (256) so the CUDA fattn vec kernel
+    // reads fixed 128-wide KV blocks without overrun and the KV_max mask scan
+    // engages; padded entries point at a masked empty cell (0 contribution). Stays
+    // <= n_kv since n_kv is itself padded to 256 and n_gather <= n_kv.
+    int64_t n_view = GGML_PAD(n_gather, 256);
+    if (n_view > K->ne[2]) {
+        n_view = K->ne[2];
+    }
+
+    ggml_tensor * idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_view, n_stream);
+    ggml_set_input(idx);
+    res->add_input(llm_graph_input_ptr(new input_block_table(mctx, idx, (uint32_t) n_view)));
+
+    // Present K and V as [d, h, n_view, ns] VIEWS of the full physical window:
+    // identical per-cell (nb1,nb2) and per-stream (nb3) strides, only the cell
+    // dim shrinks to n_view. NOT materialized - the kernel reads in place.
+    *k = ggml_view_4d(ctx0, K, K->ne[0], K->ne[1], n_view, n_stream,
+                      K->nb[1], K->nb[2], K->nb[3], 0);
+    *v = ggml_view_4d(ctx0, V, V->ne[0], V->ne[1], n_view, n_stream,
+                      V->nb[1], V->nb[2], V->nb[3], 0);
+
+    // Compact the mask to [n_gather, n_tps, 1, ns] in the same position order so
+    // the kernel's logical mask index aligns with the block table. Cheap: the
+    // mask is ~(d*h) smaller than K/V, which is why only its get_rows remains.
+    {
+        ggml_tensor * m = ggml_reshape_3d(ctx0, M, M->ne[0], M->ne[1], n_stream);
+        m = ggml_cont(ctx0, ggml_transpose(ctx0, m));
+        m = ggml_get_rows(ctx0, m, idx);
+        m = ggml_cont(ctx0, ggml_transpose(ctx0, m));
+        m = ggml_reshape_4d(ctx0, m, n_view, M->ne[1], 1, n_stream);
+        if (M->type != m->type) {
+            m = ggml_cast(ctx0, m, M->type);
+        }
+        *kq_mask = m;
+    }
+
+    *block_table = idx;
+    return true;
 }
 
 } // namespace paged_attn

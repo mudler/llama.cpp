@@ -2074,7 +2074,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * block_table) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -2109,6 +2110,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         cb(cur, LLAMA_TENSOR_NAME_FATTN, il);
 
+        if (block_table) {
+            ggml_flash_attn_ext_set_block_table(cur, block_table);
+        }
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
@@ -2358,12 +2362,19 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // [paged 0003] gather K, V and the mask to the sequence's used cells only
-    //   (no-op unless env LLAMA_KV_PAGED is set).
-    ggml_tensor * kq_mask_g = kq_mask;
-    paged_attn::gather(ctx0, res, mctx_cur, &k, &v, &kq_mask_g);
+    // [paged] decode read: when paging is active and this is a 1-token-per-stream
+    //   decode step, present K/V as n_gather views + a block table so the fattn
+    //   kernel reads the sequence's cells in-kernel (no get_rows of K/V). Else
+    //   fall back to the gather-read (prefill, transposed V, or env off). All a
+    //   no-op unless env LLAMA_KV_PAGED is set => stock byte-identical.
+    ggml_tensor * kq_mask_g   = kq_mask;
+    ggml_tensor * block_table = nullptr;
+    const bool is_decode = (q_cur->ne[2] == k->ne[3]); // 1 query token per stream
+    if (!(is_decode && paged_attn::in_kernel_decode(ctx0, res, mctx_cur, &k, &v, &kq_mask_g, &block_table))) {
+        paged_attn::gather(ctx0, res, mctx_cur, &k, &v, &kq_mask_g);
+    }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_g, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_g, sinks, v_mla, kq_scale, il, block_table);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

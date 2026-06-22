@@ -38,4 +38,22 @@ void gather(ggml_context * ctx0,
             ggml_tensor ** v,
             ggml_tensor ** kq_mask);
 
+// [paged inc1] In-kernel paged decode read. Instead of materializing the
+// sequence's cells (gather()), present K and V as n_gather-length VIEWS of the
+// full physical window and return the position-ordered physical-cell index list
+// as a block table (src[5] of ggml_flash_attn_ext). The fattn kernel/op then
+// reads K_base + block_table[j]*nb in-kernel, removing the get_rows of K and V
+// (the bulk of the gather). On return (true): *k,*v point at the views, *kq_mask
+// at the compacted mask, *block_table at the I32 [n_gather, n_stream] index.
+// Returns false (leaving *k,*v,*kq_mask untouched) when the in-kernel path does
+// not apply - env off, nothing placed, or a transposed V cache - so the caller
+// keeps the dense gather()/contiguous read.
+bool in_kernel_decode(ggml_context * ctx0,
+                      llm_graph_result * res,
+                      const llama_kv_cache_context * mctx,
+                      ggml_tensor ** k,
+                      ggml_tensor ** v,
+                      ggml_tensor ** kq_mask,
+                      ggml_tensor ** block_table);
+
 } // namespace paged_attn
