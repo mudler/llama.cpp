@@ -575,11 +575,41 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
-    // [paged] the block table (src[5]) is only honored by the vec kernel's
-    // in-kernel read; force it. build_attn only sets it for a vec-supported
-    // 1-token-per-stream decode shape.
+    // [paged] DISPATCH GUARD. The block table (src[5]) is read in-kernel ONLY by
+    // the vec and tile kernels; the mma/wmma kernels GGML_UNUSED it and would
+    // silently read the wrong (contiguous physical) cells. So when a block table
+    // is present we route here and NEVER fall through to the best-kernel switch
+    // below - no decode shape can silently reach an mma/wmma misread. build_attn
+    // only sets src[5] for the 1-token-per-stream decode shape; the vec
+    // dispatcher GGML_ABORTs for an unsupported D/type rather than mis-reading,
+    // and any shape that should not be paged must take the host-side gather path
+    // (LLAMA_KV_PAGED_GATHER=1) instead.
+    //
+    // Default route = vec (inc-1, byte-validated: vec-paged == stock at -s 1 and
+    // CPU byte-identical). LLAMA_KV_PAGED_TILE=1 routes the same shape to the
+    // tile kernel; the tile in-kernel read is plumbed (fattn-tile.cuh) for the
+    // increment-3 GQA head-group reuse, but is EXPERIMENTAL / NOT yet byte-
+    // validated: the GQA-grouped (ncols2>1) tile path reads a full nbatch_fa tile
+    // with oob_check=false while the compacted paged mask is not padded to cover
+    // it, so it diverges from stock. Not for production paged decode until
+    // increment-3 bounds that path; the default vec route is unaffected.
     if (dst->src[5] != nullptr) {
-        ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        static const bool paged_tile = getenv("LLAMA_KV_PAGED_TILE") != nullptr;
+        if (getenv("LLAMA_KV_PAGED_DISPATCH_LOG") != nullptr) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr, "[paged] decode src[5] set -> routing to %s (Q ne=[%ld,%ld,%ld,%ld])\n",
+                    paged_tile ? "TILE(experimental)" : "VEC",
+                    (long) dst->src[0]->ne[0], (long) dst->src[0]->ne[1],
+                    (long) dst->src[0]->ne[2], (long) dst->src[0]->ne[3]);
+            }
+        }
+        if (paged_tile) {
+            ggml_cuda_flash_attn_ext_tile(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        }
         return;
     }
 
