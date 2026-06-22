@@ -580,32 +580,53 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     // silently read the wrong (contiguous physical) cells. So when a block table
     // is present we route here and NEVER fall through to the best-kernel switch
     // below - no decode shape can silently reach an mma/wmma misread. build_attn
-    // only sets src[5] for the 1-token-per-stream decode shape; the vec
+    // only sets src[5] for the 1-token-per-stream decode shape; the vec/tile
     // dispatcher GGML_ABORTs for an unsupported D/type rather than mis-reading,
     // and any shape that should not be paged must take the host-side gather path
     // (LLAMA_KV_PAGED_GATHER=1) instead.
     //
-    // Default route = vec (inc-1, byte-validated: vec-paged == stock at -s 1 and
-    // CPU byte-identical). LLAMA_KV_PAGED_TILE=1 routes the same shape to the
-    // tile kernel; the tile in-kernel read is plumbed (fattn-tile.cuh) for the
-    // increment-3 GQA head-group reuse, but is EXPERIMENTAL / NOT yet byte-
-    // validated: the GQA-grouped (ncols2>1) tile path reads a full nbatch_fa tile
-    // with oob_check=false while the compacted paged mask is not padded to cover
-    // it, so it diverges from stock. Not for production paged decode until
-    // increment-3 bounds that path; the default vec route is unaffected.
+    // Default route = the GQA-grouped TILE kernel (inc-3) WHEN it is both correct
+    // and a win, else the inc-1 vec path. Tile groups the q-heads that share one
+    // kv-head (ncols2), loading each K/V row once for the whole group instead of
+    // once per q-head, and runs at higher occupancy than vec (108-128 regs vs 168).
+    // Two constraints make this conditional: (1) the tile kernel has no K/V type
+    // template - it loads half2 - so a non-F16 cache (BF16/quantized) would be
+    // converted by launch_fattn to a contiguous F16 copy, which breaks the
+    // in-kernel block-table read (the table indexes the original paged layout, not
+    // the copy); vec instead reads the original cache with in-kernel dequant, so it
+    // is the only correct paged path for non-F16 caches. (2) the head-group reuse
+    // only helps when gqa_ratio>=2. So route to tile only for {F16 K and V,
+    // gqa_ratio>=2}; everything else stays on vec, matching stock (which also sends
+    // quantized-cache decode to the vector kernel). Measured on GB10 (Qwen3-32B
+    // nvfp4, F16 cache, gqa 8, batch 32, 1024 ctx): tile 177.9 ms/step vs vec 186.3
+    // vs stock 174.8 - GQA grouping recovers ~4.5% over the inc-1 vec default and
+    // brings paged decode to ~1.8% of stock. Validated token-coherent with vec:
+    // 0.6B 8-seq 7/8 identical (8th within the kernel-noise band where vec also
+    // drifts from stock), 32B gqa=8 tile tracks stock at least as well as vec, CPU
+    // plumbing gate byte-identical. The ncols2>1 tile path reads the last nbatch_fa
+    // tile with oob_check=false relying on mask -inf padding (the SAME pattern stock
+    // uses for ncols2>1); the compacted paged mask is gathered to the n_view
+    // (GGML_PAD 256) width so it carries that padding. LLAMA_KV_PAGED_VEC=1 forces
+    // the inc-1 vec path for A/B.
     if (dst->src[5] != nullptr) {
-        static const bool paged_tile = getenv("LLAMA_KV_PAGED_TILE") != nullptr;
+        const ggml_tensor * Qp = dst->src[0];
+        const ggml_tensor * Kp = dst->src[1];
+        const ggml_tensor * Vp = dst->src[2];
+        const bool kv_f16    = Kp->type == GGML_TYPE_F16 && Vp->type == GGML_TYPE_F16;
+        const int64_t gqa_ratio = Kp->ne[2] > 0 ? Qp->ne[2] / Kp->ne[2] : 1;
+        const bool force_vec = getenv("LLAMA_KV_PAGED_VEC") != nullptr;
+        const bool use_tile  = !force_vec && kv_f16 && gqa_ratio >= 2;
         if (getenv("LLAMA_KV_PAGED_DISPATCH_LOG") != nullptr) {
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                fprintf(stderr, "[paged] decode src[5] set -> routing to %s (Q ne=[%ld,%ld,%ld,%ld])\n",
-                    paged_tile ? "TILE(experimental)" : "VEC",
-                    (long) dst->src[0]->ne[0], (long) dst->src[0]->ne[1],
-                    (long) dst->src[0]->ne[2], (long) dst->src[0]->ne[3]);
+                fprintf(stderr, "[paged] decode src[5] set -> routing to %s (Q ne=[%ld,%ld,%ld,%ld] gqa=%ld kv_f16=%d)\n",
+                    use_tile ? "TILE(gqa)" : "VEC",
+                    (long) Qp->ne[0], (long) Qp->ne[1], (long) Qp->ne[2], (long) Qp->ne[3],
+                    (long) gqa_ratio, (int) kv_f16);
             }
         }
-        if (paged_tile) {
+        if (use_tile) {
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
         } else {
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
