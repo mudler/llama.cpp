@@ -201,6 +201,15 @@ bool in_kernel_decode(ggml_context * ctx0,
         n_view = K->ne[2];
     }
 
+    // The flash-attn KV tile is 64 rows wide (nbatch_fa for head_dim 128). n_view must be
+    // a whole number of such tiles so the in-kernel decode never reads past the gathered
+    // rows: the trailing pad cells [n_gather, n_view) are all -inf, so any tile straddling
+    // the boundary still contributes zero. This holds today only because the pad (256) is a
+    // multiple of the tile; a future pad < 256 (or nbatch_fa > 256) that broke it would
+    // silently reintroduce a past-end KV leak, so assert it rather than trust it.
+    // pad must be a multiple of the flash-attn KV tile so the last tile is fully inside the -inf pad
+    GGML_ASSERT(n_view % 64 == 0);
+
     ggml_tensor * idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_view, n_stream);
     ggml_set_input(idx);
     res->add_input(llm_graph_input_ptr(new input_block_table(mctx, idx, (uint32_t) n_view)));
