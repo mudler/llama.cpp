@@ -8627,6 +8627,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // [paged P0] MXFP4/NVFP4 qwen3-30b-a3b MoE decode-density regression gate for the expert-
+    // density-aware mmq_x auto-select (patch 0015). Real expert-FFN slice (128 experts, top-8,
+    // m=768, k=2048) so this exercises the exact grouped FP4-MMA mmq kernel the model runs.
+    // Per-expert token density = n*n_used/n_mats = n/16; cover the decode band (density 1/4/8/16
+    // at n 16/64/128/256), ragged token counts (n 33/130/200: experts with 0/1/2 tokens, n not a
+    // multiple of the tile) where the tiny-M col-tiles change geometry and any masking can leak,
+    // and a prefill-density shape (n 512 => density 32) the auto-select must leave on the large
+    // 128 tile. n>=128 is exactly where stock picks mmq_x=128 and the auto-select picks 64, so the
+    // op-test (CPU oracle vs CUDA, deterministic) is the bit-exact regression gate for P1: it must
+    // pass with the auto-select on (default) and with LLAMA_MOE_AUTO_TILE=0 (stock selection).
+    for (ggml_type type_a : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        for (int n : {16, 33, 64, 128, 130, 200, 256, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 768, n, 2048));
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
