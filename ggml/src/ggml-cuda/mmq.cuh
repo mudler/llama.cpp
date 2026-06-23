@@ -6,6 +6,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 
 using namespace ggml_cuda_mma;
 
@@ -4052,6 +4053,18 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     }
 }
 
+// [paged patch 0014] MoE token-tile (mmq_x) cap, read once from env LLAMA_MOE_MMQ_X.
+// Returns 0 when unset / non-positive => disabled (stock mmq_x selection, byte-identical).
+// On the MUL_MAT_ID grouped-GEMM path this caps the per-expert column-tile width toward the
+// low MoE-decode per-expert token density, raising tile fill + occupancy (see mul_mat_q_case).
+static inline int ggml_cuda_moe_mmq_x_cap() {
+    static const int cap = []() -> int {
+        const char * s = getenv("LLAMA_MOE_MMQ_X");
+        return s ? atoi(s) : 0;
+    }();
+    return cap;
+}
+
 template <ggml_type type>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id     = ggml_cuda_get_device();
@@ -4063,10 +4076,32 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int mmq_x_max = get_mmq_x_max_host(cc);
     const int mmq_y = get_mmq_y_host(cc);
 
+    // [paged patch 0014] expert-aware MoE token-tile (mmq_x) cap.
+    // On the MUL_MAT_ID grouped-GEMM path (expert_bounds != nullptr) the GEMM columns are
+    // tokens sorted by expert; stock picks mmq_x to cover ncols_max (= ne12, the token count,
+    // up to 128) in a single column-tile. At MoE decode the per-expert token density is low
+    // (top-k of many experts: ~ne12*k/n_experts tokens/expert, e.g. ~8 at npl128 for
+    // Qwen3-30B-A3B top-8/128), so each expert's single mmq_x-wide col-tile is mostly empty:
+    // the MMA accumulator tile is mmq_x-wide at compile time and wastes throughput on the
+    // padding columns while the larger y-tile lowers occupancy. Capping mmq_x toward the
+    // per-expert density raises tile fill + occupancy with no extra weight reads (at
+    // tokens/expert <= mmq_x there is still exactly one non-empty col-tile per expert; the
+    // emptier tiles are skipped by the jt*mmq_x >= col_diff guard in the stream-k kernel).
+    // Default (env unset or <= 0) = disabled => mmq_x selection is byte-identical to stock;
+    // off the ids path the cap never applies.
+    int mmq_x_lim = mmq_x_max;
+    if (args.expert_bounds != nullptr) {
+        const int moe_cap = ggml_cuda_moe_mmq_x_cap();
+        if (moe_cap > 0) {
+            const int cap = moe_cap < 8 ? 8 : moe_cap;
+            mmq_x_lim = cap < mmq_x_max ? cap : mmq_x_max;
+        }
+    }
+
     int mmq_x_best  = 0;
     int ntiles_x_best = INT_MAX;
 
-    for (int mmq_x = 8; mmq_x <= mmq_x_max && ntiles_x_best > 1; mmq_x += 8) {
+    for (int mmq_x = 8; mmq_x <= mmq_x_lim && ntiles_x_best > 1; mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
 
         if (mmq_x % granularity != 0 || mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) {
