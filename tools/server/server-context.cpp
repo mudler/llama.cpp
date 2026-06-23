@@ -3044,6 +3044,29 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // PAGED serving lever (patch 0013): decoupled per-step prefill-token budget.
+        // Analogue of vLLM's --max-num-batched-tokens. Stock llama-server caps the prompt
+        // tokens ingested per update_slots() step at n_batch only; with cont_batching the
+        // sampled decode tokens of every generating slot are appended FIRST, then prompt
+        // tokens fill the batch up to n_batch. A long prompt therefore grabs an ~n_batch
+        // chunk in a SINGLE compute-heavy step, spiking the inter-token latency of every
+        // co-batched decoder (head-of-line jitter). LLAMA_PREFILL_BUDGET caps the prompt
+        // tokens added per step independently of n_batch, splitting a long prefill across
+        // more steps so in-flight decode keeps advancing smoothly. Default (env unset or
+        // <=0) = disabled => stock behavior is byte-identical. Orthogonal to LLAMA_KV_PAGED
+        // (this is a pure scheduler knob; works with paged off).
+        int32_t n_prefill_budget = 0; // 0 = disabled (stock n_batch-only chunking)
+        {
+            const char * env_pb = getenv("LLAMA_PREFILL_BUDGET");
+            if (env_pb) {
+                const int v = atoi(env_pb);
+                if (v > 0) {
+                    n_prefill_budget = std::min(n_batch, std::max(1, v));
+                }
+            }
+        }
+        int32_t n_prompt_budgeted = 0; // prompt tokens added to the batch this step (across slots)
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3488,7 +3511,10 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // (patch 0013) also stop once the per-step prefill budget is spent, so a long
+                    // prompt is split across more steps and leaves batch room for co-batched decode
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
+                           (n_prefill_budget == 0 || n_prompt_budgeted < n_prefill_budget)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3513,6 +3539,7 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
+                        n_prompt_budgeted++; // (patch 0013) count toward the per-step prefill budget
 
                         // stop the prompt batch exactly before a user message
                         if (spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3597,6 +3624,11 @@ private:
 
                 if (!slot_batched) {
                     slot_batched = &slot;
+                }
+                // (patch 0013) stop adding prompts once the per-step prefill budget is spent,
+                // leaving the remaining batch capacity for co-batched decode of other slots
+                if (n_prefill_budget > 0 && n_prompt_budgeted >= n_prefill_budget) {
+                    add_ok = false;
                 }
             });
         }
