@@ -3044,24 +3044,78 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
-        // PAGED serving lever (patch 0013): decoupled per-step prefill-token budget.
-        // Analogue of vLLM's --max-num-batched-tokens. Stock llama-server caps the prompt
-        // tokens ingested per update_slots() step at n_batch only; with cont_batching the
-        // sampled decode tokens of every generating slot are appended FIRST, then prompt
-        // tokens fill the batch up to n_batch. A long prompt therefore grabs an ~n_batch
-        // chunk in a SINGLE compute-heavy step, spiking the inter-token latency of every
-        // co-batched decoder (head-of-line jitter). LLAMA_PREFILL_BUDGET caps the prompt
-        // tokens added per step independently of n_batch, splitting a long prefill across
-        // more steps so in-flight decode keeps advancing smoothly. Default (env unset or
-        // <=0) = disabled => stock behavior is byte-identical. Orthogonal to LLAMA_KV_PAGED
-        // (this is a pure scheduler knob; works with paged off).
-        int32_t n_prefill_budget = 0; // 0 = disabled (stock n_batch-only chunking)
+        // PAGED serving lever (patch 0016, supersedes 0013): dynamic decode-first
+        // per-step prefill-token budget (continuous-batch scheduler P1). llama-server
+        // already builds ONE mixed batch per update_slots() step: Phase 1 (just above)
+        // appended every generating slot's sampled token UNCONDITIONALLY, so at this point
+        // batch.n_tokens == D is the live decode load; Phase 2 (below) fills the remaining
+        // batch capacity with prompt tokens. Patch 0013 capped Phase 2 with a STATIC
+        // constant (LLAMA_PREFILL_BUDGET) that ignores D, needs per-workload tuning, and
+        // lets one long prompt monopolise the step.
+        //
+        // This computes a DYNAMIC budget instead, the vLLM v1 token-budget analogue:
+        // a single total per-step token budget T, decode claims its D tokens first
+        // (already in the batch), and prefill gets the leftover T - D distributed across
+        // waiting prompts with a per-slot chunk cap. As decode load D rises the prefill
+        // leftover auto-shrinks, so the step never inflates past T at any concurrency:
+        // the budget self-tunes across the npl range and across dense vs MoE without a
+        // hand-picked constant (the 161/333 tok/s GB10 decode ceiling is held tuning-free
+        // instead of via 0013's hand-tuned 256). Decode is structurally claimed first and
+        // never capped (Phase 1), so the decode-first guarantee is free here.
+        //
+        //   LLAMA_MAX_BATCH_TOKENS (T)  total per-step token budget (decode + prefill),
+        //                               default n_batch, clamped to [n_ubatch, n_batch] so
+        //                               the compute loop stays a single llama_decode and
+        //                               prefill keeps an n_ubatch floor of progress.
+        //   LLAMA_PREFILL_CAP           per-slot max prompt tokens per step (the
+        //                               long_prefill_token_threshold analogue), default
+        //                               min(T, ceil(0.04*n_ctx)) floored at n_ubatch, so
+        //                               one long prompt cannot eat the whole leftover.
+        //   LLAMA_PREFILL_BUDGET        legacy static cap (patch 0013); honoured ONLY when
+        //                               LLAMA_MAX_BATCH_TOKENS is unset, for back-compat.
+        //
+        // DEFAULT-OFF BYTE-IDENTICAL: with all three knobs unset, and in the degenerate
+        // T == n_batch case, behaviour is byte-identical to stock. At T == n_batch the
+        // dynamic leftover max(n_ubatch, n_batch - D) and the n_batch per-slot cap both
+        // reach the existing `batch.n_tokens < n_batch` ceiling at the SAME point, so no
+        // new bound fires (the determinism oracle). Orthogonal to LLAMA_KV_PAGED: pure
+        // scheduler policy, identical decisions with paged on or off.
+        const int32_t n_decode_in_batch = batch.size();    // D: Phase 1 appended D decode tokens above
+        int32_t prefill_budget_step  = 0; // 0 = disabled (stock n_batch-only chunking)
+        int32_t prefill_cap_per_slot = 0; // 0 = disabled (no per-slot prompt-chunk cap)
         {
-            const char * env_pb = getenv("LLAMA_PREFILL_BUDGET");
-            if (env_pb) {
+            int32_t mbt = 0;
+            if (const char * env_mbt = getenv("LLAMA_MAX_BATCH_TOKENS")) {
+                mbt = atoi(env_mbt);
+            }
+            if (mbt > 0) {
+                // dynamic decode-first budget (P1): T clamped to [n_ubatch, n_batch]
+                int32_t T = std::min(n_batch, mbt);
+                T = std::max(T, n_ubatch);
+                // leftover after decode, floored at n_ubatch so prefill never fully starves
+                prefill_budget_step = std::max(n_ubatch, T - n_decode_in_batch);
+                // per-slot prompt-chunk cap (long_prefill_token_threshold analogue)
+                int32_t cap = 0;
+                if (const char * env_cap = getenv("LLAMA_PREFILL_CAP")) {
+                    cap = atoi(env_cap);
+                }
+                if (cap <= 0) {
+                    const int32_t pct4 = (n_ctx + 24) / 25; // ceil(0.04 * n_ctx)
+                    cap = std::min(T, std::max(n_ubatch, pct4));
+                }
+                cap = std::min(n_batch, std::max(n_ubatch, cap));
+                // at T == n_batch the leftover and cap both reach the n_batch ceiling
+                // together; pin the cap to n_batch so this case stays byte-identical
+                if (T >= n_batch) {
+                    cap = n_batch;
+                }
+                prefill_cap_per_slot = cap;
+            } else if (const char * env_pb = getenv("LLAMA_PREFILL_BUDGET")) {
+                // legacy static budget (patch 0013), kept for back-compat when the
+                // dynamic knob is unset: a constant per-step prefill cap, no per-slot cap
                 const int v = atoi(env_pb);
                 if (v > 0) {
-                    n_prefill_budget = std::min(n_batch, std::max(1, v));
+                    prefill_budget_step = std::min(n_batch, std::max(1, v));
                 }
             }
         }
@@ -3510,11 +3564,18 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // (patch 0016) per-slot prompt tokens added this step, for the per-slot
+                    // chunk cap (resets each slot); n_batch stays the hard compute ceiling
+                    int32_t slot_prompt_added = 0;
+
                     // add prompt tokens for processing in the current batch
-                    // (patch 0013) also stop once the per-step prefill budget is spent, so a long
-                    // prompt is split across more steps and leaves batch room for co-batched decode
+                    // (patch 0016) also stop once (a) the dynamic per-step prefill budget
+                    // (the T - D leftover) is spent across all slots, or (b) this slot's
+                    // per-slot chunk cap is hit, so a long prompt is split across more steps
+                    // and leaves batch room for co-batched decode of the other slots
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch &&
-                           (n_prefill_budget == 0 || n_prompt_budgeted < n_prefill_budget)) {
+                           (prefill_budget_step  == 0 || n_prompt_budgeted < prefill_budget_step) &&
+                           (prefill_cap_per_slot == 0 || slot_prompt_added < prefill_cap_per_slot)) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3539,7 +3600,8 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
-                        n_prompt_budgeted++; // (patch 0013) count toward the per-step prefill budget
+                        n_prompt_budgeted++;  // (patch 0016) toward the dynamic per-step prefill budget
+                        slot_prompt_added++;  // (patch 0016) toward this slot's per-step chunk cap
 
                         // stop the prompt batch exactly before a user message
                         if (spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3625,9 +3687,10 @@ private:
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
-                // (patch 0013) stop adding prompts once the per-step prefill budget is spent,
-                // leaving the remaining batch capacity for co-batched decode of other slots
-                if (n_prefill_budget > 0 && n_prompt_budgeted >= n_prefill_budget) {
+                // (patch 0016) stop admitting prompts once the dynamic per-step prefill
+                // budget (the T - D leftover) is spent, leaving the remaining batch
+                // capacity for co-batched decode of the other slots
+                if (prefill_budget_step > 0 && n_prompt_budgeted >= prefill_budget_step) {
                     add_ok = false;
                 }
             });
