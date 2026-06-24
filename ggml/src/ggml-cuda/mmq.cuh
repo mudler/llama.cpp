@@ -140,7 +140,24 @@ static constexpr __device__ int get_mmq_x_max_device() {
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
 
-static int get_mmq_y_host(const int cc) {
+// [paged patch 0017 / track B] Dense NVFP4 decode mmq_y (weight-row tile) override.
+// mmq_y tiles the N (weight-row) dimension of the FP4-MMA weight GEMM. Lowering it raises the
+// number of resident CTAs (smaller per-CTA shared footprint + smaller per-thread accumulator) to
+// hide LPDDR5x weight-load latency at the M=128 decode tile, WITHOUT re-reading weights: every
+// weight row lives in exactly one row-tile, so total weight traffic is unchanged (bandwidth-
+// neutral) - the dense-decode occupancy lever from FP4_GEMM_SCOPE_B.md s3/s4.1. mmq_y is a PURE
+// N-row tiling knob: the per-output reduction over K is identical for any mmq_y, so the result
+// stays BIT-EXACT (gated by test-backend-ops MUL_MAT NVFP4 decode shapes). Default 128 == exact
+// stock behaviour (a default build is byte-identical to stock); build -DGGML_CUDA_FP4_MMQ_Y=64
+// (or 96) to enable the tune. Applies ONLY to NVFP4 on Blackwell; every other type/arch untouched.
+#ifndef GGML_CUDA_FP4_MMQ_Y
+#define GGML_CUDA_FP4_MMQ_Y 128
+#endif
+
+static int get_mmq_y_host(const int cc, const ggml_type type = GGML_TYPE_COUNT) {
+    if (GGML_CUDA_FP4_MMQ_Y != 128 && type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc)) {
+        return GGML_CUDA_FP4_MMQ_Y;
+    }
     return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
 }
@@ -154,7 +171,13 @@ if (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4) {
     return MMQ_ITER_K;
 }
 
+template <ggml_type type = GGML_TYPE_COUNT>
 static constexpr __device__ int get_mmq_y_device() {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if (type == GGML_TYPE_NVFP4 && GGML_CUDA_FP4_MMQ_Y != 128) {
+        return GGML_CUDA_FP4_MMQ_Y;
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 #if defined(GGML_USE_HIP)
 #if defined(RDNA1)
     return 64;
@@ -168,6 +191,28 @@ static constexpr __device__ int get_mmq_y_device() {
     return 64;
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 #endif // defined(GGML_USE_HIP)
+}
+
+// [paged patch 0017 / track B] Dense NVFP4 decode occupancy lever: min resident CTAs per SM.
+// The FP4-MMA mul_mat_q is REGISTER-bound to 1 CTA/SM (__launch_bounds__(256,1) => ~255 regs/thread
+// => one resident block, the under-occupancy that strands the kernel at ~3% of FP4 peak at M=128).
+// Raising the __launch_bounds__ min-blocks operand register-caps the compiler so N CTAs co-reside,
+// hiding LPDDR5x weight-load latency by CTA-parallelism (the scope s4.1 occupancy goal) WITHOUT a
+// structural mmq_y/nwarps change and WITHOUT extra weight reads (each weight tile still read once).
+// Register allocation cannot change results => BIT-EXACT (gated by test-backend-ops MUL_MAT NVFP4).
+// Default 1 == exact stock behaviour (byte-identical); build -DGGML_CUDA_FP4_MINBLOCKS=2 to enable.
+// Applies ONLY to NVFP4 on Blackwell; every other type/arch keeps the stock min-blocks.
+#ifndef GGML_CUDA_FP4_MINBLOCKS
+#define GGML_CUDA_FP4_MINBLOCKS 1
+#endif
+template <ggml_type type = GGML_TYPE_COUNT>
+static constexpr __device__ int mmq_get_min_blocks_device(const int stock) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if (type == GGML_TYPE_NVFP4 && GGML_CUDA_FP4_MINBLOCKS != 1) {
+        return GGML_CUDA_FP4_MINBLOCKS;
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+    return stock;
 }
 
 // Decouple shared memory tile sizes from WARP_SIZE to allow for different warp sizes.
@@ -3454,7 +3499,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = mmq_get_nwarps_device();
     constexpr int              qk         = ggml_cuda_type_traits<type>::qk;
-    constexpr int              mmq_y      = get_mmq_y_device();
+    constexpr int              mmq_y      = get_mmq_y_device<type>();
     constexpr load_tiles_mmq_t load_tiles = mmq_type_traits<mmq_x, mmq_y, need_check, type>::load_tiles;
 
     extern __shared__ int data_mul_mat_q[];
@@ -3531,13 +3576,13 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 template <ggml_type type, int mmq_x, bool need_check>
 #if defined(GGML_USE_HIP)
 #if defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), mmq_get_min_blocks_device<type>(2))
 #endif // defined(RDNA4) || defined(RDNA3) || defined(RDNA2) || defined(CDNA) || defined(GCN)
 #else
 #if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 1)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), mmq_get_min_blocks_device<type>(1))
 #else
-    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
+    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), mmq_get_min_blocks_device<type>(2))
 #endif // __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 #endif // defined(GGML_USE_HIP)
 static __global__ void mul_mat_q(
@@ -3558,7 +3603,7 @@ static __global__ void mul_mat_q(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr int qk    = ggml_cuda_type_traits<type>::qk;
-    constexpr int mmq_y = get_mmq_y_device();
+    constexpr int mmq_y = get_mmq_y_device<type>();
 
     const uint32_t nty = (nrows_x + mmq_y - 1) / mmq_y; // Number of tiles y
 
@@ -3790,7 +3835,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx) {
-    constexpr int mmq_y           = get_mmq_y_device();
+    constexpr int mmq_y           = get_mmq_y_device<type>();
     constexpr int qk              = ggml_cuda_type_traits<type>::qk;
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
@@ -3947,7 +3992,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int nsm = ggml_cuda_info().devices[id].nsm;
     const int warp_size = ggml_cuda_info().devices[id].warp_size;
     const int nwarps = mmq_get_nwarps_host(cc, warp_size);
-    const int mmq_y = get_mmq_y_host(cc);
+    const int mmq_y = get_mmq_y_host(cc, type);
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
@@ -4103,6 +4148,21 @@ static inline int ggml_cuda_moe_density_max() {
     return d;
 }
 
+// [paged patch 0017 / track B] DENSE NVFP4 decode mmq_x re-read occupancy DIAGNOSTIC (env, default off).
+// GGML_CUDA_FP4_DENSE_MMQ_X=<n> caps the dense (non-MoE) NVFP4 col-tile to <n>, splitting the M=128
+// decode ubatch into ceil(128/n) col-tiles. Each col-tile re-reads the full weight set (fatal cost
+// in the BW-bound regime) but multiplies resident CTAs. This is the scope s4.1 A/B probe: if
+// decode_agg RISES with cap=64 despite the 2x weight read, occupancy is badly broken (the kernel is
+// compute/occupancy-bound, so mmq_y-down / min-blocks has large upside); if it FALLS, the tile is
+// already bandwidth-saturated and the occupancy ceiling is lower. Unset/<=0 => stock selection.
+static inline int ggml_cuda_fp4_dense_mmq_x_cap() {
+    static const int c = []() -> int {
+        const char * s = getenv("GGML_CUDA_FP4_DENSE_MMQ_X");
+        return s ? atoi(s) : 0;
+    }();
+    return c;
+}
+
 template <ggml_type type>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id     = ggml_cuda_get_device();
@@ -4112,7 +4172,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     const int nwarps    = mmq_get_nwarps_host(cc, warp_size);
 
     const int mmq_x_max = get_mmq_x_max_host(cc);
-    const int mmq_y = get_mmq_y_host(cc);
+    const int mmq_y = get_mmq_y_host(cc, type);
 
     // [paged patch 0015] expert-density-aware MoE token-tile (mmq_x) auto-select (DEFAULT-ON).
     // On the MUL_MAT_ID grouped-GEMM path (expert_bounds != nullptr) the GEMM columns are tokens
@@ -4145,6 +4205,13 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     //   - LLAMA_MOE_AUTO_TILE=0 : disable the auto-select (exact stock selection).
     //   - LLAMA_MOE_DECODE_TILE=<n>, LLAMA_MOE_DENSITY_MAX=<n> : tune the tile / threshold.
     int mmq_x_lim = mmq_x_max;
+    if (args.expert_bounds == nullptr && type == GGML_TYPE_NVFP4) {
+        // dense NVFP4 decode mmq_x re-read occupancy diagnostic (see ggml_cuda_fp4_dense_mmq_x_cap).
+        const int cap = ggml_cuda_fp4_dense_mmq_x_cap();
+        if (cap > 0 && cap < mmq_x_max) {
+            mmq_x_lim = cap < 8 ? 8 : cap;
+        }
+    }
     if (args.expert_bounds != nullptr) {
         const int moe_cap = ggml_cuda_moe_mmq_x_cap();
         if (moe_cap > 0) {

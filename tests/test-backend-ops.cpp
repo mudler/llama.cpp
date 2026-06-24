@@ -8643,6 +8643,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // [paged P0 / track B] NVFP4/MXFP4 dense decode-shape mmq_y-down bit-exact gate.
+    // The dense FP4 weight GEMM is the track-B target; P1 lowers mmq_y (the weight-row tile) on the
+    // NVFP4 decode path to raise resident-CTA occupancy. mmq_y is a pure N-row tiling knob, so a
+    // smaller mmq_y must stay BIT-EXACT (identical per-output reduction over K) - this gate proves
+    // it. m = weight rows (N, tiled by mmq_y): 2048 (exact at mmq_y 64 & 128), 1600 (ragged vs 128),
+    // 2050 (ragged vs both 64 & 128 -> exercises the need_check last-row-tile at both). n = decode
+    // token count M = 32 and 128 (the scope decode shapes, tiled by mmq_x). k = 2048 hidden. Must
+    // pass with the default build (mmq_y=128) AND a mmq_y=64 build, CUDA-vs-CPU oracle, bit-exact.
+    for (ggml_type type_a : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        for (int64_t m : {2048, 1600, 2050}) {
+            for (int64_t n : {32, 128}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 2048, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
     }
