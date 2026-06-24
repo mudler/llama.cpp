@@ -6282,6 +6282,74 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+// ggml_gated_delta_net_inplace
+//
+// Same recurrence as ggml_gated_delta_net with K == 1, but the final recurrent state is written
+// in place into `state_dst` (a view into the persistent recurrent-state cache) instead of being
+// appended to the op output. This removes the per-layer per-step D2D state copy-back during decode.
+// The op output holds ONLY the attention scores; the state region is still allocated (unused) so
+// the attention-output view layout is identical to ggml_gated_delta_net.
+struct ggml_tensor * ggml_gated_delta_net_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * state_dst) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_dst != NULL);
+    GGML_ASSERT(state_dst->type == GGML_TYPE_F32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+
+    GGML_ASSERT(state->ne[0] == S_v);
+    GGML_ASSERT(state->ne[1] == S_v);
+    GGML_ASSERT(state->ne[2] == H);
+    GGML_ASSERT(state->ne[3] == n_seqs);
+
+    // state_dst holds the per-seq final state contiguously: [S_v*S_v*H, >= n_seqs]
+    GGML_ASSERT(state_dst->ne[0] == S_v * S_v * H);
+    GGML_ASSERT(state_dst->ne[1] >= n_seqs);
+    GGML_ASSERT(state_dst->nb[0] == sizeof(float));
+
+    const int64_t state_rows = S_v * n_seqs; // K == 1
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, 1); // K == 1
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = state_dst;
+
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {

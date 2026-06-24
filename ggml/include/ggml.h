@@ -2579,6 +2579,20 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // same recurrence as ggml_gated_delta_net with K == 1, but the final recurrent state is written
+    // in place into state_dst (a view into the recurrent-state cache) instead of being appended to
+    // the op output, eliminating the per-step state copy-back during decode. state_dst must be a
+    // contiguous [S_v*S_v*H, n_seqs] view (per-seq stride == dense state size).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * state_dst);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);

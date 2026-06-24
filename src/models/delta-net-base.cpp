@@ -546,6 +546,36 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const bool keep = cparams.n_rs_seq > 0;
 
     if (!keep) {
+        const bool fused = (n_seq_tokens == 1) ? cparams.fused_gdn_ar : cparams.fused_gdn_ch;
+
+        if (fused) {
+            // In-place state write-back: the fused gated-DeltaNet op writes the new recurrent state
+            // directly into the persistent cache slot for the active sequences (a contiguous block
+            // at kv_head), eliminating the per-layer per-step ~full-state D2D copy-back that
+            // dominated decode. The op output then carries only the attention scores.
+            ggml_tensor * state_dst = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs,
+                    ssm_states_all->nb[1], kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+
+            ggml_tensor * result = ggml_gated_delta_net_inplace(ctx0, q, k, v, g, b, s, state_dst);
+            if (n_seq_tokens == 1) {
+                cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
+            } else {
+                cb(result, LLAMA_TENSOR_NAME_FGDN_CH, il);
+            }
+
+            ggml_tensor * output = ggml_view_4d(ctx0, result,
+                    S_v, H_v, n_seq_tokens, n_seqs,
+                    ggml_row_size(result->type, S_v),
+                    ggml_row_size(result->type, S_v * H_v),
+                    ggml_row_size(result->type, S_v * H_v * n_seq_tokens), 0);
+            cb(output, "attn_output", il);
+
+            // the state write is a side effect of the op; pull the op into the graph via the output
+            ggml_build_forward_expand(gf, output);
+
+            return output;
+        }
+
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;

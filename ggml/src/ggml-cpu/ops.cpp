@@ -10627,6 +10627,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * src_state_dst = dst->src[6]; // optional in-place final-state write-back target
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -10687,6 +10688,16 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    // when src_state_dst is provided (in-place decode write-back) the final state is written
+    // directly into the persistent cache view, removing the separate state copy-back node.
+    float * inplace_state_base = nullptr;
+    if (src_state_dst != nullptr) {
+        GGML_ASSERT(K == 1);
+        GGML_ASSERT(src_state_dst->nb[0] == sizeof(float));
+        GGML_ASSERT(src_state_dst->nb[1] == (size_t) S_v * S_v * H * sizeof(float));
+        inplace_state_base = (float *) src_state_dst->data;
+    }
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
@@ -10701,7 +10712,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // For K>1, work in scratch and copy out per-token when the slot is in range.
         float * s_out = (K > 1)
             ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+            : (inplace_state_base ? inplace_state_base : state_out_base) + (iv3 * H + iv1) * S_v * S_v;
 
         // copy input state into the working buffer and operate in-place
         // state layout [S_v, S_v, H, n_seqs]: seq iv3 starts at iv3 * state_seq_stride.
