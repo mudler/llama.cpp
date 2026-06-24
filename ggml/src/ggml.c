@@ -6350,6 +6350,82 @@ struct ggml_tensor * ggml_gated_delta_net_inplace(
     return result;
 }
 
+// ggml_gated_delta_net_inplace_ids
+//
+// Same recurrence as ggml_gated_delta_net_inplace, but the prior recurrent state is read directly
+// from the FULL state cache `state` ([S_v, S_v, H, n_rs_slots]) at cache[ids[seq]] (mirroring
+// ggml_ssm_scan's ids source) instead of from a materialized ggml_get_rows gather. `rs_head` is the
+// destination base slot, used by the backend to detect the common identity case (ids[s] == rs_head
+// + s), where the prior state already lives in the in-place destination slots.
+struct ggml_tensor * ggml_gated_delta_net_inplace_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * state_dst,
+        struct ggml_tensor  * ids,
+        int                   rs_head) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    GGML_ASSERT(q->type    == GGML_TYPE_F32);
+    GGML_ASSERT(k->type    == GGML_TYPE_F32);
+    GGML_ASSERT(v->type    == GGML_TYPE_F32);
+    GGML_ASSERT(g->type    == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state_dst != NULL && state_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids != NULL && ids->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(g->ne[0] == 1 || g->ne[0] == S_v);
+    GGML_ASSERT(beta->ne[0] == 1);
+
+    // state is the FULL recurrent-state cache: [S_v, S_v, H, n_rs_slots], n_rs_slots >= n_seqs
+    GGML_ASSERT(state->ne[0] == S_v);
+    GGML_ASSERT(state->ne[1] == S_v);
+    GGML_ASSERT(state->ne[2] == H);
+    GGML_ASSERT(state->ne[3] >= n_seqs);
+
+    // state_dst holds the per-seq final state contiguously: [S_v*S_v*H, >= n_seqs]
+    GGML_ASSERT(state_dst->ne[0] == S_v * S_v * H);
+    GGML_ASSERT(state_dst->ne[1] >= n_seqs);
+    GGML_ASSERT(state_dst->nb[0] == sizeof(float));
+
+    // ids: per-seq source slot into the full cache (s_copy_main)
+    GGML_ASSERT(ids->ne[0] >= n_seqs);
+
+    const int64_t state_rows = S_v * n_seqs; // K == 1
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, 1);       // K == 1
+    ggml_set_op_params_i32(result, 1, rs_head); // destination base slot (for the ids identity check)
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;     // FULL cache (read via ids)
+    result->src[6] = state_dst; // in-place final-state write-back target
+    result->src[7] = ids;       // per-seq source slots (s_copy)
+
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {

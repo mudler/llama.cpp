@@ -524,6 +524,69 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+// Step 2: gather-free recurrent attention. Mirrors mamba-base's get_ssm_rows pattern: the fused
+// gated-DeltaNet op reads each sequence's prior state directly from the full cache via the s_copy
+// ids (no ggml_get_rows materialization) and writes the new state in place (Step 1). The non-fused
+// and rollback paths fall back to materializing the prior state and delegating below.
+ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        ggml_tensor *        q,
+        ggml_tensor *        k,
+        ggml_tensor *        v,
+        ggml_tensor *        g,
+        ggml_tensor *        b,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+    const auto   kv_head  = mctx_cur->get_head();
+
+    const int64_t S_v          = v->ne[0];
+    const int64_t H_v          = v->ne[1];
+    const int64_t n_seqs       = v->ne[3];
+    const int64_t n_seq_tokens = q->ne[2];
+
+    const bool keep  = cparams.n_rs_seq > 0;
+    const bool fused = (n_seq_tokens == 1) ? cparams.fused_gdn_ar : cparams.fused_gdn_ch;
+
+    if (!keep && fused) {
+        // build_rs feeds the FULL state cache + the s_copy ids into the op (via the get_state_rows
+        // lambda, exactly like mamba-base's ggml_ssm_scan) and still performs the rs_zero clear and
+        // the extra-states copy around it. The op reads curr_state from cache[ids[seq]] and writes
+        // the final state in place at kv_head; no recurrent-state materialization at all.
+        auto get_state_op = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) -> ggml_tensor * {
+            ggml_tensor * cache4d = ggml_reshape_4d(ctx, states, S_v, S_v, H_v, states->ne[1]);
+            ggml_tensor * state_dst = ggml_view_2d(ctx, ssm_states_all, hparams.n_embd_s(), n_seqs,
+                    ssm_states_all->nb[1], kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+            return ggml_gated_delta_net_inplace_ids(ctx, q, k, v, g, b, cache4d, state_dst, ids, (int) kv_head);
+        };
+
+        ggml_tensor * result = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, get_state_op);
+        if (n_seq_tokens == 1) {
+            cb(result, LLAMA_TENSOR_NAME_FGDN_AR, il);
+        } else {
+            cb(result, LLAMA_TENSOR_NAME_FGDN_CH, il);
+        }
+
+        ggml_tensor * output = ggml_view_4d(ctx0, result,
+                S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * H_v),
+                ggml_row_size(result->type, S_v * H_v * n_seq_tokens), 0);
+        cb(output, "attn_output", il);
+
+        // the state write is a side effect of the op; pull the op into the graph via the output
+        ggml_build_forward_expand(gf, output);
+
+        return output;
+    }
+
+    // non-fused / rollback: materialize the prior state via gather and delegate to the
+    // state-taking overload (its fused !keep branch performs the Step-1 in-place write).
+    ggml_tensor * s = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    s = ggml_reshape_4d(ctx0, s, S_v, S_v, H_v, n_seqs);
+    return build_recurrent_attn(inp, ssm_states_all, q, k, v, g, b, s, il);
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,

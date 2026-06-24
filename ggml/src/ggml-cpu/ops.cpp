@@ -10660,7 +10660,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+    int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
     const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
     const int ith = params->ith;
@@ -10680,6 +10680,26 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
     const float * state_in_base = (const float *)src_state->data;
+
+    // Step 2: fused recurrent-state gather (ids == s_copy in src[7]). Read the prior state directly
+    // from the full cache at cache[ids[seq]] instead of from a materialized gather. For the identity
+    // decode case the prior state is the in-place destination block [rs_head, rs_head+n_seqs);
+    // otherwise the dispatcher has gathered cache[ids[seq]] into the (unused) output-state scratch
+    // region. Bit-identical to the get_rows path.
+    ggml_tensor * src_ids = dst->src[7];
+    if (src_ids != nullptr) {
+        const int64_t   D       = S_v * S_v * H;
+        const int32_t   rs_head = ggml_get_op_params_i32(dst, 1);
+        const int32_t * ids     = (const int32_t *) src_ids->data;
+        bool identity = true;
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            if (ids[s] != rs_head + (int32_t) s) { identity = false; break; }
+        }
+        state_seq_stride = D;
+        state_in_base = identity
+            ? (const float *) src_state->data + (int64_t) rs_head * D
+            : (const float *) state_out_base; // gathered by the dispatcher (non-identity)
+    }
 
   //const int64_t rq1 = nev1 / neq1;
   //const int64_t rk1 = nev1 / nek1;
@@ -10804,6 +10824,33 @@ static void ggml_compute_forward_gated_delta_net_f32(
 
     if (ith == 0) {
       ggml_threadpool_chunk_set(params->threadpool, nth);
+
+      // Step 2: non-identity ids fallback -- serially gather each sequence's prior state from
+      // cache[ids[seq]] into the (otherwise unused) output-state scratch region before the parallel
+      // recurrence, so the in-place write never aliases another sequence's read.
+      ggml_tensor * src_ids = dst->src[7];
+      if (src_ids != nullptr) {
+          const ggml_tensor * src_state = dst->src[5];
+          const int64_t S_v      = V->ne[0];
+          const int64_t H        = V->ne[1];
+          const int64_t n_tokens = V->ne[2];
+          const int64_t n_seqs   = V->ne[3];
+          const int64_t D        = S_v * S_v * H;
+          const int32_t   rs_head = ggml_get_op_params_i32(dst, 1);
+          const int32_t * ids     = (const int32_t *) src_ids->data;
+          bool identity = true;
+          for (int64_t s = 0; s < n_seqs; ++s) {
+              if (ids[s] != rs_head + (int32_t) s) { identity = false; break; }
+          }
+          if (!identity) {
+              const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+              const float * cache   = (const float *) src_state->data;
+              float *       scratch = (float *) dst->data + attn_score_elems;
+              for (int64_t s = 0; s < n_seqs; ++s) {
+                  memcpy(scratch + s * D, cache + (int64_t) ids[s] * D, D * sizeof(float));
+              }
+          }
+      }
     }
 
     ggml_barrier(params->threadpool);

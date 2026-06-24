@@ -88,6 +88,19 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        b,
             ggml_tensor *        s,
             int                  il);
+
+    // Step 2: gather-free variant. Reads the prior recurrent state directly from the full cache via
+    // the s_copy ids (no ggml_get_rows materialization) on the fused decode/prefill path, and
+    // delegates to the state-taking overload for the non-fused and rollback paths.
+    ggml_tensor * build_recurrent_attn(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        ssm_states_all,
+            ggml_tensor *        q,
+            ggml_tensor *        k,
+            ggml_tensor *        v,
+            ggml_tensor *        g,
+            ggml_tensor *        b,
+            int                  il);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

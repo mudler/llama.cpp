@@ -2593,6 +2593,23 @@ extern "C" {
             struct ggml_tensor  * state,
             struct ggml_tensor  * state_dst);
 
+    // Step 2: same recurrence as ggml_gated_delta_net_inplace, but the prior recurrent state is read
+    // directly from the full state cache via per-sequence indices (ids == s_copy), mirroring
+    // ggml_ssm_scan, instead of from a materialized ggml_get_rows gather. `state` is the FULL cache
+    // [S_v, S_v, H, n_rs_slots]; `ids` are the per-seq source slots; `rs_head` is the destination
+    // base slot. Eliminates the recurrent-state gather on the decode path.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_inplace_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * state_dst,
+            struct ggml_tensor  * ids,
+            int                   rs_head);
+
     // custom operators
 
     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
