@@ -451,16 +451,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     // Apply gated normalization: self.norm(core_attn_out, z)
     ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
 
-    // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_tokens, n_seqs, n_heads * head_dim]
-    ggml_tensor * final_output = ggml_reshape_3d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens, n_seqs);
+    // Lever 1: collapse the gated-DeltaNet output to 2D [value_dim, n_seq_tokens * n_seqs] so the
+    // ssm_out projection runs as an M = n_seq_tokens*n_seqs MMQ tensor-core GEMM. The prior
+    // reshape_3d to [value_dim, 1, n_seqs] left src1->ne[1]=1, routing decode to the batch-1 MMVQ
+    // GEMV which does not amortize the ssm_out weight read across the sequences. Same contiguous
+    // data, just a 2D vs 3D view, so the result is bit-identical.
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
     cb(final_output, "final_output", il);
 
-    // Output projection
+    // Output projection (output is already 2D [n_embd, n_seq_tokens * n_seqs])
     cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
     cb(cur, "linear_attn_out", il);
-
-    // Reshape back to original dimensions
-    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
 
     return cur;
 }
