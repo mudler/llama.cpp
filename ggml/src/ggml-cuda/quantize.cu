@@ -419,6 +419,43 @@ void quantize_mmq_q8_1_cuda(
     }
 }
 
+// MoE NVFP4 quantize de-dup (0023): for the broadcast (up/gate) expert matmuls every
+// gathered row references one of ne12 unique token activations, so the stock path
+// re-quantizes each token n_expert_used times. Quantize the unique tokens once, then copy
+// the resulting block_fp4_mmq rows into the expert-gathered layout keyed by ids. This is a
+// pure byte copy of identical blocks => the gathered buffer is byte-identical to stock.
+static __global__ void gather_mmq_fp4(
+        const uint4 * __restrict__ unique, const int32_t * __restrict__ ids,
+        uint4 * __restrict__ gathered, const int ne11_flat, const int ne12_unique,
+        const int64_t total_words) {
+    constexpr int W = (int) (sizeof(block_fp4_mmq) / sizeof(uint4)); // 9 uint4 per 144B block
+    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= total_words) {
+        return;
+    }
+    const int     w   = (int) (t % W);
+    const int64_t ib  = t / W;                 // destination block index = kb*ne11_flat + j
+    const int     j   = (int) (ib % ne11_flat);
+    const int     kb  = (int) (ib / ne11_flat);
+    const int     src = ids[j];
+    const int64_t ib_u = (int64_t) kb * ne12_unique + src;
+    gathered[t] = unique[ib_u * W + w];
+}
+
+void gather_mmq_fp4_cuda(
+        const void * unique, const int32_t * ids, void * gathered,
+        int64_t ne11_flat, int64_t ne12_unique, int64_t ne0_padded, cudaStream_t stream) {
+    const int     blocks_per_col = (int) ((ne0_padded + QK_K - 1) / QK_K);
+    constexpr int W = (int) (sizeof(block_fp4_mmq) / sizeof(uint4));
+    const int64_t total_words = ne11_flat * (int64_t) blocks_per_col * W;
+    const int     bs = 256;
+    const dim3    block_size(bs, 1, 1);
+    const dim3    num_blocks((unsigned) ((total_words + bs - 1) / bs), 1, 1);
+    gather_mmq_fp4<<<num_blocks, block_size, 0, stream>>>(
+        (const uint4 *) unique, ids, (uint4 *) gathered,
+        (int) ne11_flat, (int) ne12_unique, total_words);
+}
+
 void quantize_mmq_fp4_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,

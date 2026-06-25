@@ -26,6 +26,10 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+void gather_mmq_fp4_cuda(const void * unique, const int32_t * ids, void * gathered,
+                         int64_t ne11_flat, int64_t ne12_unique, int64_t ne0_padded,
+                         cudaStream_t stream);
+
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,
                              void *          vy,

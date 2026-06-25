@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
@@ -197,8 +198,24 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
 
         if (use_native_fp4) {
-            quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
-                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            // 0023: de-dup the broadcast (up/gate) quantize. ne11==1 means src1 is shared
+            // across experts, so quantize the ne12 unique tokens once and gather the blocks.
+            static const bool moe_quant_dedup = []{
+                const char * e = getenv("GGML_CUDA_MOE_QUANT_DEDUP");
+                return e ? atoi(e) != 0 : true;  // 0023: on by default; GGML_CUDA_MOE_QUANT_DEDUP=0 disables
+            }();
+            if (moe_quant_dedup && ne11 == 1) {
+                const size_t nbytes_unique = ne12*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+                    get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+                ggml_cuda_pool_alloc<char> src1_unique(ctx.pool(), nbytes_unique);
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_unique.get(), src0->type, ne10, s12, 0, 0,
+                                        ne10_padded, ne12, 1, 1, stream);
+                gather_mmq_fp4_cuda(src1_unique.get(), ids_src1.get(), src1_q8_1.get(),
+                                    ne11_flat, ne12, ne10_padded, stream);
+            } else {
+                quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                        ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            }
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
