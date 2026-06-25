@@ -9490,13 +9490,84 @@ static void ggml_compute_forward_ssm_conv_f32(
     }
 }
 
+// Fused decode-time depthwise causal conv1d update (mirror of the CUDA ssm_conv_update_f32). Reads the
+// K-1 cached taps (src[0]) and the single new token (src[2]), computes the depthwise conv with the same
+// ascending-tap FMA order as ggml_compute_forward_ssm_conv_f32, optionally folds silu, writes the conv
+// output to dst, and writes the 1-token-shifted ring state back in place into src[3]. Threads split
+// over channels.
+static void ggml_compute_forward_ssm_conv_update_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * conv_states = dst->src[0]; // [K-1, channels, n_seqs]
+    const ggml_tensor * conv_kernel = dst->src[1]; // [K, channels]
+    const ggml_tensor * x_cur       = dst->src[2]; // [channels, 1, n_seqs]
+    ggml_tensor       * cdst        = dst->src[3]; // [(K-1)*channels, n_seqs] in-place ring target
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t d_conv   = conv_kernel->ne[0];
+    const int64_t channels = conv_kernel->ne[1];
+    const int64_t n_seqs   = conv_states->ne[2];
+    const bool    apply_silu = ggml_get_op_params_i32(dst, 0) != 0;
+
+    GGML_ASSERT(conv_states->nb[0] == sizeof(float));
+    GGML_ASSERT(conv_kernel->nb[0] == sizeof(float));
+
+    const int64_t states_seq_stride = conv_states->nb[2] / sizeof(float);
+    const int64_t states_ch_stride  = conv_states->nb[1] / sizeof(float);
+    const int64_t w_stride          = conv_kernel->nb[1] / sizeof(float);
+    const int64_t x_seq_stride      = x_cur->nb[2] / sizeof(float);
+    const int64_t dst_seq_stride    = dst->nb[2] / sizeof(float);
+    const int64_t cdst_seq_stride   = cdst->nb[1] / sizeof(float);
+
+    const float * states_base = (const float *) conv_states->data;
+    const float * w_base      = (const float *) conv_kernel->data;
+    const float * x_base      = (const float *) x_cur->data;
+    float *       cdst_base   = (float *) cdst->data;
+    float *       dst_base    = (float *) dst->data;
+
+    const int64_t dc = (channels + nth - 1) / nth;
+    const int64_t c0 = dc * ith;
+    const int64_t c1 = MIN(c0 + dc, channels);
+
+    for (int64_t s = 0; s < n_seqs; ++s) {
+        for (int64_t c = c0; c < c1; ++c) {
+            const float * states_c = states_base + s * states_seq_stride + c * states_ch_stride;
+            const float * w_c      = w_base + c * w_stride;
+            const float   xc       = x_base[s * x_seq_stride + c];
+
+            // ascending-tap FMA: tap0*w0 + ... + tap_{K-2}*w_{K-2} + xc*w_{K-1} (matches ssm_conv)
+            float sumf = 0.0f;
+            for (int64_t j = 0; j < d_conv - 1; ++j) {
+                sumf += states_c[j] * w_c[j];
+            }
+            sumf += xc * w_c[d_conv - 1];
+            sumf += 0.0f; // matches ssm_conv `sumf += b` with b == 0
+
+            dst_base[s * dst_seq_stride + c] = apply_silu ? (sumf / (1.0f + expf(-sumf))) : sumf;
+
+            // 1-token-shifted ring write-back: [tap1 .. tap_{K-2}, xc]
+            float * out_state = cdst_base + s * cdst_seq_stride + c * (d_conv - 1);
+            for (int64_t j = 0; j < d_conv - 2; ++j) {
+                out_state[j] = states_c[j + 1];
+            }
+            out_state[d_conv - 2] = xc;
+        }
+    }
+}
+
 void ggml_compute_forward_ssm_conv(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_ssm_conv_f32(params, dst);
+                if (dst->src[3] != nullptr) {
+                    ggml_compute_forward_ssm_conv_update_f32(params, dst);
+                } else {
+                    ggml_compute_forward_ssm_conv_f32(params, dst);
+                }
             } break;
         default:
             {

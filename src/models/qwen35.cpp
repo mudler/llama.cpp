@@ -385,15 +385,26 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    // Patch 0021: on the single-token decode path, fuse the conv window assembly + depthwise conv +
+    // silu + the 1-token-shifted ring write-back into one in-place op (removes concat_cont, the
+    // transpose materialization, cpy_scalar and the separate silu). Bit-identical to the chain below.
+    const bool conv_decode_fused = (n_seq_tokens == 1) && (cparams.n_rs_seq == 0) && cparams.fused_gdn_ar;
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
-    cb(conv_output_proper, "conv_output_raw", il);
+    ggml_tensor * conv_qkv_mix;
+    if (conv_decode_fused) {
+        conv_qkv_mix = build_conv_state_fused(inp, conv_states_all, qkv_mixed, conv_kernel,
+                conv_kernel_size, conv_channels, il);
+    } else {
+        ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
-    cb(conv_output_silu, "conv_output_silu", il);
+        ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        cb(conv_output_proper, "conv_output_raw", il);
 
-    ggml_tensor * conv_qkv_mix = conv_output_silu;
+        ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+        cb(conv_output_silu, "conv_output_silu", il);
+
+        conv_qkv_mix = conv_output_silu;
+    }
 
     // Calculate the total conv dimension
     int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;

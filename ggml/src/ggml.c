@@ -5552,6 +5552,60 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+// ggml_ssm_conv_update_inplace
+//
+// Fused decode-time depthwise causal conv1d update. Reuses GGML_OP_SSM_CONV but is discriminated by a
+// non-null src[3]. The op reads each channel's K-1 cached taps from `conv_states` and the single new
+// token from `x_cur`, computes the depthwise conv (ascending-tap FMA, bit-identical to ggml_ssm_conv),
+// optionally folds SiLU, writes the conv output to dst ([channels, 1, n_seqs]) and writes the
+// 1-token-shifted ring state back in place into `conv_state_dst` (the active sequences' conv-cache
+// slot). op_params[0] carries the fuse_silu flag. Mirrors the 0018/0019 in-place state pattern.
+struct ggml_tensor * ggml_ssm_conv_update_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * conv_states,
+        struct ggml_tensor  * conv_kernel,
+        struct ggml_tensor  * x_cur,
+        struct ggml_tensor  * conv_state_dst,
+        bool                  fuse_silu) {
+    GGML_ASSERT(ggml_is_3d(conv_states));
+    GGML_ASSERT(ggml_is_matrix(conv_kernel));
+    GGML_ASSERT(ggml_is_3d(x_cur));
+
+    const int64_t d_conv   = conv_kernel->ne[0];
+    const int64_t channels = conv_kernel->ne[1];
+    const int64_t n_seqs   = conv_states->ne[2];
+
+    GGML_ASSERT(conv_states->type    == GGML_TYPE_F32);
+    GGML_ASSERT(conv_kernel->type    == GGML_TYPE_F32);
+    GGML_ASSERT(x_cur->type          == GGML_TYPE_F32);
+    GGML_ASSERT(conv_state_dst != NULL && conv_state_dst->type == GGML_TYPE_F32);
+
+    // conv_states: [K-1, channels, n_seqs], contiguous taps per channel
+    GGML_ASSERT(conv_states->ne[0] == d_conv - 1);
+    GGML_ASSERT(conv_states->ne[1] == channels);
+    GGML_ASSERT(conv_states->nb[0] == sizeof(float));
+    // x_cur: single decode token per sequence
+    GGML_ASSERT(x_cur->ne[0] == channels);
+    GGML_ASSERT(x_cur->ne[1] == 1);
+    GGML_ASSERT(x_cur->ne[2] == n_seqs);
+    // conv_state_dst: [(K-1)*channels, n_seqs] in-place ring write target
+    GGML_ASSERT(conv_state_dst->ne[0] == (d_conv - 1) * channels);
+    GGML_ASSERT(conv_state_dst->ne[1] >= n_seqs);
+    GGML_ASSERT(conv_state_dst->nb[0] == sizeof(float));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, 1, n_seqs);
+
+    ggml_set_op_params_i32(result, 0, fuse_silu ? 1 : 0);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = conv_states;
+    result->src[1] = conv_kernel;
+    result->src[2] = x_cur;
+    result->src[3] = conv_state_dst;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(

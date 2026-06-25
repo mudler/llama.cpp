@@ -3775,6 +3775,43 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV fused decode conv-update-in-place (ggml_ssm_conv_update_inplace, patch 0021).
+// Validates the conv + silu output (dst) against the CPU reference across backends. The 1-token-
+// shifted ring write-back to conv_state_dst is a side effect (validated end-to-end by the greedy
+// md5 gate); here it just exercises the in-place write target as an op src.
+struct test_ssm_conv_update : public test_case {
+    const int64_t d_conv;
+    const int64_t channels;
+    const int64_t n_seqs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_UPDATE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(d_conv, channels, n_seqs);
+    }
+
+    test_ssm_conv_update(int64_t d_conv = 4, int64_t channels = 256, int64_t n_seqs = 4)
+        : d_conv(d_conv), channels(channels), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * conv_states    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, channels, n_seqs);
+        ggml_tensor * conv_kernel    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, channels);
+        ggml_tensor * x_cur          = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, 1, n_seqs);
+        ggml_tensor * conv_state_dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1) * channels, n_seqs);
+        ggml_set_name(conv_states, "conv_states");
+        ggml_set_name(conv_kernel, "conv_kernel");
+        ggml_set_name(x_cur, "x_cur");
+        ggml_set_name(conv_state_dst, "conv_state_dst");
+
+        ggml_tensor * out = ggml_ssm_conv_update_inplace(ctx, conv_states, conv_kernel, x_cur, conv_state_dst, true);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -8395,6 +8432,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
                 test_cases.emplace_back(new test_ssm_conv_bias_silu(
                     GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}, fuse_bias));
+            }
+        }
+    }
+
+    // fused decode conv-update-in-place (ggml_ssm_conv_update_inplace, patch 0021). channels must be
+    // a multiple of 128 for the CUDA SSM_CONV supports_op gate.
+    for (int64_t d_conv : {3, 4}) {
+        for (int64_t channels : {256, 3328}) {
+            for (int64_t n_seqs : {1, 4, 32, 128}) {
+                test_cases.emplace_back(new test_ssm_conv_update(d_conv, channels, n_seqs));
             }
         }
     }

@@ -2447,6 +2447,22 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // Fused decode-time depthwise causal conv1d update (mirrors vLLM causal_conv1d_update). Assembles
+    // the width-K conv window in registers from the cached K-1 taps (`conv_states`, [K-1, channels,
+    // n_seqs]) plus the single current token (`x_cur`, [channels, 1, n_seqs]), computes the depthwise
+    // conv with the SAME ascending-tap FMA order as ggml_ssm_conv, optionally folds SiLU, and writes
+    // the 1-token-shifted ring state back IN PLACE into `conv_state_dst` (a [(K-1)*channels, n_seqs]
+    // view into the conv-state cache). This eliminates the concat + transpose + scalar copy-back +
+    // separate silu of the decode conv path. Output: [channels, 1, n_seqs]. Reuses GGML_OP_SSM_CONV;
+    // detected by the backends via a non-null src[3]. n_seq_tokens must be 1 (single-token decode).
+    GGML_API struct ggml_tensor * ggml_ssm_conv_update_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * conv_states,
+            struct ggml_tensor  * conv_kernel,
+            struct ggml_tensor  * x_cur,
+            struct ggml_tensor  * conv_state_dst,
+            bool                  fuse_silu);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

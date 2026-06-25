@@ -524,6 +524,57 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+// Fused decode conv path (patch 0021). Reads the active sequences' prior conv-state taps (the same
+// cheap build_rs gather as build_conv_state), then fuses the depthwise conv + silu + the 1-token-
+// shifted ring write-back into a single ggml_ssm_conv_update_inplace op. This removes the concat
+// (concat_cont), the transpose materialization, the scalar copy-back (cpy_scalar) and the separate
+// silu of the decode conv path. The op reads from the (disjoint) materialized taps and writes the
+// new ring state in place into the cache slot at kv_head -- exactly the slot the baseline ggml_cpy
+// wrote -- so it is bit-identical to build_conv_state + ggml_ssm_conv + ggml_silu.
+ggml_tensor * llm_build_delta_net_base::build_conv_state_fused(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        qkv_mixed,
+        ggml_tensor *        conv_kernel,
+        int64_t              conv_kernel_size,
+        int64_t              conv_channels,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+    const auto   kv_head  = mctx_cur->get_head();
+
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+
+    GGML_ASSERT(n_seq_tokens == 1);        // single-token decode only
+    GGML_ASSERT(cparams.n_rs_seq == 0);    // no rollback splits on this path
+
+    // Prior conv-state taps for the active sequences: [K-1, conv_channels, n_seqs]. Same get_rows
+    // gather as the baseline build_conv_state read (tiny; not one of the eliminated buckets).
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+    cb(conv_states, "conv_states_reshaped", il);
+
+    // Current token, native (non-transposed) qkv_mixed: [conv_channels, 1, n_seqs].
+    ggml_tensor * x_cur = ggml_reshape_3d(ctx0, qkv_mixed, conv_channels, n_seq_tokens, n_seqs);
+
+    // In-place ring write-back target = the active sequences' conv-cache slot at kv_head, exactly the
+    // destination the baseline ggml_cpy wrote to (s_slot == 0).
+    const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+    const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
+    ggml_tensor * conv_state_dst =
+        ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1], kv_head * row_size);
+    cb(conv_state_dst, "conv_state_update", il);
+
+    ggml_tensor * conv_output =
+        ggml_ssm_conv_update_inplace(ctx0, conv_states, conv_kernel, x_cur, conv_state_dst, /*fuse_silu=*/true);
+    cb(conv_output, "conv_output_silu", il);
+
+    // the ring write is a side effect of the op; pull the op into the graph via the output
+    ggml_build_forward_expand(gf, conv_output);
+
+    return conv_output; // [conv_channels, 1, n_seqs], already silu'd
+}
+
 // Step 2: gather-free recurrent attention. Mirrors mamba-base's get_ssm_rows pattern: the fused
 // gated-DeltaNet op reads each sequence's prior state directly from the full cache via the s_copy
 // ids (no ggml_get_rows materialization) and writes the new state in place (Step 1). The non-fused

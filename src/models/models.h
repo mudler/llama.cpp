@@ -76,6 +76,20 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // Fused decode-time conv path (patch 0021). Replaces the concat + transpose + ssm_conv + silu +
+    // copy-back chain with a single ggml_ssm_conv_update_inplace op that reads the cached K-1 taps and
+    // the current token, computes the depthwise conv, folds silu, and writes the 1-token-shifted ring
+    // state back in place. Decode-only (n_seq_tokens == 1, n_rs_seq == 0). Returns the silu'd conv
+    // output: (conv_channels, 1, n_seqs). Bit-identical to the build_conv_state + ggml_ssm_conv chain.
+    ggml_tensor * build_conv_state_fused(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        conv_states_all,
+            ggml_tensor *        qkv_mixed,
+            ggml_tensor *        conv_kernel,
+            int64_t              conv_kernel_size,
+            int64_t              conv_channels,
+            int                  il);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(
