@@ -5606,6 +5606,68 @@ struct ggml_tensor * ggml_ssm_conv_update_inplace(
     return result;
 }
 
+// ggml_ssm_conv_update_inplace_ids
+//
+// Gather-free variant of ggml_ssm_conv_update_inplace (patch 0028). Instead of a pre-gathered
+// per-sequence tap scratch, it takes the FULL conv-state cache (`conv_states` = [K-1, channels,
+// n_cells]) plus the per-sequence `ids` (the recurrent-state s_copy) and reads each active sequence's
+// prior taps directly from cache[ids[s]] inside the kernel (no ggml_get_rows). Identity sequences
+// (ids[s] == rs_head + s) read in place from the `conv_state_dst` write slot; non-identity sequences
+// are gathered into a disjoint scratch by the backend first. Bit-identical to the get_rows +
+// ggml_ssm_conv_update_inplace path. Reuses GGML_OP_SSM_CONV, discriminated by a non-null src[4].
+// op_params[1] carries rs_head. Mirrors the 0019 ggml_gated_delta_net_inplace_ids gather fusion.
+struct ggml_tensor * ggml_ssm_conv_update_inplace_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * conv_states,
+        struct ggml_tensor  * conv_kernel,
+        struct ggml_tensor  * x_cur,
+        struct ggml_tensor  * conv_state_dst,
+        struct ggml_tensor  * ids,
+        int                   rs_head,
+        bool                  fuse_silu) {
+    GGML_ASSERT(ggml_is_3d(conv_states));
+    GGML_ASSERT(ggml_is_matrix(conv_kernel));
+    GGML_ASSERT(ggml_is_3d(x_cur));
+    GGML_ASSERT(ids != NULL && ids->type == GGML_TYPE_I32);
+
+    const int64_t d_conv   = conv_kernel->ne[0];
+    const int64_t channels = conv_kernel->ne[1];
+    const int64_t n_seqs   = x_cur->ne[2];
+
+    GGML_ASSERT(conv_states->type    == GGML_TYPE_F32);
+    GGML_ASSERT(conv_kernel->type    == GGML_TYPE_F32);
+    GGML_ASSERT(x_cur->type          == GGML_TYPE_F32);
+    GGML_ASSERT(conv_state_dst != NULL && conv_state_dst->type == GGML_TYPE_F32);
+
+    // conv_states: FULL cache [K-1, channels, n_cells], contiguous taps per channel
+    GGML_ASSERT(conv_states->ne[0] == d_conv - 1);
+    GGML_ASSERT(conv_states->ne[1] == channels);
+    GGML_ASSERT(conv_states->nb[0] == sizeof(float));
+    // x_cur: single decode token per sequence
+    GGML_ASSERT(x_cur->ne[0] == channels);
+    GGML_ASSERT(x_cur->ne[1] == 1);
+    // ids: one slot index per active sequence
+    GGML_ASSERT(ids->ne[0] == n_seqs);
+    // conv_state_dst: [(K-1)*channels, n_seqs] in-place ring write target
+    GGML_ASSERT(conv_state_dst->ne[0] == (d_conv - 1) * channels);
+    GGML_ASSERT(conv_state_dst->ne[1] >= n_seqs);
+    GGML_ASSERT(conv_state_dst->nb[0] == sizeof(float));
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, 1, n_seqs);
+
+    ggml_set_op_params_i32(result, 0, fuse_silu ? 1 : 0);
+    ggml_set_op_params_i32(result, 1, rs_head);
+
+    result->op     = GGML_OP_SSM_CONV;
+    result->src[0] = conv_states;
+    result->src[1] = conv_kernel;
+    result->src[2] = x_cur;
+    result->src[3] = conv_state_dst;
+    result->src[4] = ids;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(

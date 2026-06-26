@@ -3812,6 +3812,65 @@ struct test_ssm_conv_update : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV gather-free fused decode conv-update via ids (ggml_ssm_conv_update_inplace_ids,
+// patch 0028). conv_states is the FULL cache; ids (a shuffled permutation of [0,n_seqs), rs_head=0)
+// selects each sequence's slot, exercising BOTH the identity in-place read (ids[s]==s) and the
+// non-identity cache read. Validates the conv + silu output (dst) against the CPU reference.
+struct test_ssm_conv_update_ids : public test_case {
+    const int64_t d_conv;
+    const int64_t channels;
+    const int64_t n_seqs;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_UPDATE_IDS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(d_conv, channels, n_seqs);
+    }
+
+    test_ssm_conv_update_ids(int64_t d_conv = 4, int64_t channels = 256, int64_t n_seqs = 4)
+        : d_conv(d_conv), channels(channels), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * conv_states    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, channels, n_seqs);
+        ggml_tensor * conv_kernel    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, channels);
+        ggml_tensor * x_cur          = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, 1, n_seqs);
+        ggml_tensor * conv_state_dst = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1) * channels, n_seqs);
+        ggml_tensor * ids            = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(conv_states, "conv_states");
+        ggml_set_name(conv_kernel, "conv_kernel");
+        ggml_set_name(x_cur, "x_cur");
+        ggml_set_name(conv_state_dst, "conv_state_dst");
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_ssm_conv_update_inplace_ids(ctx, conv_states, conv_kernel, x_cur,
+                conv_state_dst, ids, /*rs_head=*/0, /*fuse_silu=*/true);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // ids: shuffled permutation of [0, n_seqs) into the full cache (rs_head == 0), so some
+                // sequences are identity (ids[s] == s, in-place read) and some are not (scratch read).
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i;
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), 0, t->ne[0] * sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -8442,6 +8501,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t channels : {256, 3328}) {
             for (int64_t n_seqs : {1, 4, 32, 128}) {
                 test_cases.emplace_back(new test_ssm_conv_update(d_conv, channels, n_seqs));
+            }
+        }
+    }
+
+    // gather-free fused decode conv-update via ids (ggml_ssm_conv_update_inplace_ids, patch 0028).
+    // channels must be a multiple of 128 for the CUDA SSM_CONV supports_op gate.
+    for (int64_t d_conv : {3, 4}) {
+        for (int64_t channels : {256, 3328}) {
+            for (int64_t n_seqs : {1, 4, 32, 128}) {
+                test_cases.emplace_back(new test_ssm_conv_update_ids(d_conv, channels, n_seqs));
             }
         }
     }

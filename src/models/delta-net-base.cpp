@@ -548,25 +548,33 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state_fused(
     GGML_ASSERT(n_seq_tokens == 1);        // single-token decode only
     GGML_ASSERT(cparams.n_rs_seq == 0);    // no rollback splits on this path
 
-    // Prior conv-state taps for the active sequences: [K-1, conv_channels, n_seqs]. Same get_rows
-    // gather as the baseline build_conv_state read (tiny; not one of the eliminated buckets).
-    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
-    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
-    cb(conv_states, "conv_states_reshaped", il);
-
     // Current token, native (non-transposed) qkv_mixed: [conv_channels, 1, n_seqs].
     ggml_tensor * x_cur = ggml_reshape_3d(ctx0, qkv_mixed, conv_channels, n_seq_tokens, n_seqs);
 
     // In-place ring write-back target = the active sequences' conv-cache slot at kv_head, exactly the
     // destination the baseline ggml_cpy wrote to (s_slot == 0).
-    const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+    const int64_t row_count = (conv_kernel_size - 1) * conv_channels; // = n_embd_r
     const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
     ggml_tensor * conv_state_dst =
         ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1], kv_head * row_size);
     cb(conv_state_dst, "conv_state_update", il);
 
-    ggml_tensor * conv_output =
-        ggml_ssm_conv_update_inplace(ctx0, conv_states, conv_kernel, x_cur, conv_state_dst, /*fuse_silu=*/true);
+    // Patch 0028: fuse the residual conv-state tap gather (the k_get_rows that build_conv_state's
+    // build_rs left firing -- ~the biggest single residual decode kernel, see MOE_GAP_VS_VLLM.md).
+    // Exactly like the 0019 SSM-state gather fusion, build_rs feeds the FULL conv cache + the s_copy
+    // ids into the op (via the get_state_rows lambda) and still performs the rs_zero clear and the
+    // extra-states copy around it; the op reads each active sequence's prior taps directly from
+    // cache[ids[s]] (identity sequences read in place from conv_state_dst), so the separate
+    // ggml_get_rows materialization is eliminated. The read VALUES are unchanged, only the read path
+    // (gather -> indexed in-kernel read) changes, so it is bit-identical to the build_rs gather.
+    auto get_conv_op = [&](ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) -> ggml_tensor * {
+        // states = full conv-state cache reshaped 2d [n_embd_r, n_cells]
+        ggml_tensor * cache3d = ggml_reshape_3d(ctx, states, conv_kernel_size - 1, conv_channels, states->ne[1]);
+        return ggml_ssm_conv_update_inplace_ids(ctx, cache3d, conv_kernel, x_cur, conv_state_dst,
+                ids, (int) kv_head, /*fuse_silu=*/true);
+    };
+
+    ggml_tensor * conv_output = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs, get_conv_op);
     cb(conv_output, "conv_output_silu", il);
 
     // the ring write is a side effect of the op; pull the op into the graph via the output

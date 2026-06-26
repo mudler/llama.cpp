@@ -2463,6 +2463,26 @@ extern "C" {
             struct ggml_tensor  * conv_state_dst,
             bool                  fuse_silu);
 
+    // Gather-free variant of ggml_ssm_conv_update_inplace (patch 0028). Instead of a pre-gathered
+    // per-sequence tap scratch, it takes the FULL conv-state cache (`conv_states` = [K-1, channels,
+    // n_cells]) plus the per-sequence `ids` ([n_seqs], I32, = the recurrent-state s_copy) and reads
+    // each active sequence's prior taps directly from cache[ids[s]] inside the kernel -- no
+    // ggml_get_rows materialization (mirrors ggml_gated_delta_net_inplace_ids). Identity sequences
+    // (ids[s] == rs_head + s) are read in place from `conv_state_dst` (the write slot); any
+    // non-identity sequence (reorder / rs_zero remap) is gathered into a disjoint scratch by the
+    // backend first, so the read never aliases another sequence's in-place ring write -> race-free
+    // and bit-identical to the get_rows + ggml_ssm_conv_update_inplace path. op_params[0]=fuse_silu,
+    // op_params[1]=rs_head. Reuses GGML_OP_SSM_CONV, discriminated by a non-null src[4].
+    GGML_API struct ggml_tensor * ggml_ssm_conv_update_inplace_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * conv_states,
+            struct ggml_tensor  * conv_kernel,
+            struct ggml_tensor  * x_cur,
+            struct ggml_tensor  * conv_state_dst,
+            struct ggml_tensor  * ids,
+            int                   rs_head,
+            bool                  fuse_silu);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

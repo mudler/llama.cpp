@@ -226,6 +226,153 @@ static void ggml_cuda_op_ssm_conv_update(ggml_backend_cuda_context & ctx, ggml_t
     }
 }
 
+// Patch 0028: gather only the NON-identity sequences' prior conv taps from the FULL conv cache into a
+// disjoint scratch buffer. Identity sequences (ids[s] == rs_head + s) are read in place from the
+// destination slot by the update kernel and are skipped here. One block per sequence. Mirrors
+// gdn_gather_nonident_kernel (the 0019 recurrent-state gather fusion).
+static __global__ void ssm_conv_gather_nonident_kernel(const float * __restrict__ cache,
+                                                       const int32_t * __restrict__ ids, int rs_head,
+                                                       float * __restrict__ scratch, int row_stride, int n_seqs) {
+    const int s = blockIdx.x;
+    if (s >= n_seqs) {
+        return;
+    }
+    const int r = ids[s];
+    if (r == rs_head + s) {
+        return; // identity: prior taps already live in the in-place destination slot
+    }
+    const float * src = cache   + (int64_t) r * row_stride;
+    float *       dst = scratch + (int64_t) s * row_stride;
+    for (int i = threadIdx.x; i < row_stride; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+// Patch 0028: gather-free fused conv update. Per (channel, sequence), read the K-1 prior taps from the
+// active sequence's cache slot via ids -- identity (ids[s] == rs_head + s) reads in place from
+// conv_state_dst (the same slot it writes; the whole window is loaded into registers before any write,
+// so it is race-free), non-identity reads the pre-gathered disjoint scratch -- then computes the
+// depthwise conv with the SAME ascending-tap FMA order as ssm_conv_update_f32, folds silu, writes the
+// conv output, and writes the 1-token-shifted ring state back in place. Bit-identical to the get_rows +
+// ssm_conv_update_f32 path: the read VALUES are the same; only the read POINTER changes.
+template <bool apply_silu, int d_conv>
+static __global__ void ssm_conv_update_ids_f32(const float * __restrict__ nonident_scratch,
+                                               const float * __restrict__ conv_kernel,
+                                               const float * __restrict__ x_cur,
+                                               float       * __restrict__ conv_state_dst,
+                                               float       * __restrict__ dst,
+                                               const int32_t * __restrict__ ids,
+                                               const int   rs_head,
+                                               const int   channels,
+                                               const int   scratch_seq_stride,
+                                               const int   w_stride,
+                                               const int   x_seq_stride,
+                                               const int   dst_seq_stride,
+                                               const int   cdst_seq_stride) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x; // channel
+    const int s = blockIdx.y;                            // sequence
+    if (c >= channels) {
+        return;
+    }
+
+    const bool ident = (ids[s] == rs_head + s);
+    const float * states_c = ident
+        ? conv_state_dst   + (int64_t) s * cdst_seq_stride    + (int64_t) c * (d_conv - 1)
+        : nonident_scratch + (int64_t) s * scratch_seq_stride + (int64_t) c * (d_conv - 1);
+    const float * w_c = conv_kernel + (int64_t) c * w_stride;
+    const float   xc  = x_cur[(int64_t) s * x_seq_stride + c];
+
+    // window = [tap0 .. tap_{K-2}, current-token], same ordering as ssm_conv_update_f32
+    float window[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; j++) {
+        window[j] = states_c[j];
+    }
+    window[d_conv - 1] = xc;
+
+    float sumf = 0.0f;
+#pragma unroll
+    for (int j = 0; j < d_conv; j++) {
+        sumf += window[j] * w_c[j];
+    }
+    sumf += 0.0f; // matches ssm_conv_f32 `sumf += b` with b == 0 (qwen35 conv1d has no bias)
+    dst[(int64_t) s * dst_seq_stride + c] = apply_silu ? ggml_cuda_op_silu_single(sumf) : sumf;
+
+    // 1-token-shifted ring write-back: drop the oldest tap, append the current token
+    float * out_state = conv_state_dst + (int64_t) s * cdst_seq_stride + (int64_t) c * (d_conv - 1);
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; j++) {
+        out_state[j] = window[j + 1];
+    }
+}
+
+static void ggml_cuda_op_ssm_conv_update_ids(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * conv_states = dst->src[0]; // FULL cache [K-1, channels, n_cells]
+    const ggml_tensor * conv_kernel = dst->src[1]; // [K, channels]
+    const ggml_tensor * x_cur       = dst->src[2]; // [channels, 1, n_seqs]
+    const ggml_tensor * cdst        = dst->src[3]; // [(K-1)*channels, n_seqs] in-place ring target
+    const ggml_tensor * ids         = dst->src[4]; // [n_seqs] I32 slot indices (s_copy)
+
+    const int64_t d_conv   = conv_kernel->ne[0];
+    const int64_t channels = conv_kernel->ne[1];
+    const int64_t n_seqs   = x_cur->ne[2];
+    const bool    apply_silu = ggml_get_op_params_i32(dst, 0) != 0;
+    const int     rs_head    = ggml_get_op_params_i32(dst, 1);
+
+    GGML_ASSERT(conv_states->type == GGML_TYPE_F32 && conv_kernel->type == GGML_TYPE_F32);
+    GGML_ASSERT(x_cur->type == GGML_TYPE_F32 && cdst->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(conv_states->nb[0] == sizeof(float));
+    GGML_ASSERT(conv_states->nb[1] == (size_t) (d_conv - 1) * sizeof(float));
+    GGML_ASSERT(conv_kernel->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->ne[0] == channels && dst->ne[1] == 1 && dst->ne[2] == n_seqs);
+
+    const float *   cache_d = (const float *) conv_states->data;
+    const float *   w_d     = (const float *) conv_kernel->data;
+    const float *   x_d     = (const float *) x_cur->data;
+    float *         cdst_d  = (float *) cdst->data;
+    float *         dst_d   = (float *) dst->data;
+    const int32_t * ids_d   = (const int32_t *) ids->data;
+    cudaStream_t    stream  = ctx.stream();
+
+    // n_embd_r = (K-1)*channels: the per-cell row stride of the full conv cache.
+    const int cache_row_stride = (int) (conv_states->nb[2] / sizeof(float));
+    const int w_stride         = (int) (conv_kernel->nb[1] / sizeof(float));
+    const int x_seq_stride     = (int) (x_cur->nb[2] / sizeof(float));
+    const int dst_seq_stride   = (int) (dst->nb[2] / sizeof(float));
+    const int cdst_seq_stride  = (int) (cdst->nb[1] / sizeof(float));
+
+    // Gather only the non-identity sequences' prior taps into a disjoint scratch (identity sequences
+    // read in place from cdst). The scratch is written here and read-only by the update kernel, so the
+    // update kernel never reads a slot another block writes -> race-free. No-op at steady AR decode.
+    ggml_cuda_pool_alloc<float> nonident_scratch(ctx.pool());
+    float * scratch = nonident_scratch.alloc((size_t) cache_row_stride * n_seqs);
+    if (n_seqs > 0) {
+        ssm_conv_gather_nonident_kernel<<<(unsigned) n_seqs, 256, 0, stream>>>(
+            cache_d, ids_d, rs_head, scratch, cache_row_stride, (int) n_seqs);
+    }
+
+    const int threads = 128;
+    const dim3 blocks((channels + threads - 1) / threads, (unsigned) n_seqs, 1);
+
+    auto launch = [&](auto NC) {
+        constexpr int kNC = decltype(NC)::value;
+        if (apply_silu) {
+            ssm_conv_update_ids_f32<true, kNC><<<blocks, threads, 0, stream>>>(scratch, w_d, x_d, cdst_d, dst_d,
+                ids_d, rs_head, (int) channels, cache_row_stride, w_stride, x_seq_stride, dst_seq_stride, cdst_seq_stride);
+        } else {
+            ssm_conv_update_ids_f32<false, kNC><<<blocks, threads, 0, stream>>>(scratch, w_d, x_d, cdst_d, dst_d,
+                ids_d, rs_head, (int) channels, cache_row_stride, w_stride, x_seq_stride, dst_seq_stride, cdst_seq_stride);
+        }
+    };
+
+    switch (d_conv) {
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        default: GGML_ABORT("ssm_conv_update_ids only supports d_conv 3 or 4");
+    }
+}
+
 template <bool apply_silu>
 static void ssm_conv_f32_cuda(const float * src0, const float * src1, const float * bias, const int src0_nb0, const int src0_nb1,
                               const int src0_nb2, const int src1_nb1, float * dst, const int dst_nb0, const int dst_nb1,
@@ -266,7 +413,13 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
     // silu of the decode conv path into a single kernel.
     if (dst->src[3] != nullptr) {
         GGML_ASSERT(bias_add_node == nullptr && silu_dst == nullptr);
-        ggml_cuda_op_ssm_conv_update(ctx, dst);
+        // Patch 0028: a non-null src[4] (ids) selects the gather-free variant that reads each
+        // sequence's prior taps directly from the full cache via ids (no get_rows materialization).
+        if (dst->src[4] != nullptr) {
+            ggml_cuda_op_ssm_conv_update_ids(ctx, dst);
+        } else {
+            ggml_cuda_op_ssm_conv_update(ctx, dst);
+        }
         return;
     }
 
