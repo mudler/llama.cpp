@@ -48,6 +48,11 @@ public:
     void append_n(const std::vector<KVCacheBlock*>& blocks);
     void prepend_n(const std::vector<KVCacheBlock*>& blocks);
     std::vector<KVCacheBlock*> get_all_free_blocks() const;
+    // [paged 0024 Fix-2] Relink the intrusive free list to the given order using
+    // THIS queue's fake head/tail (the nodes' addresses are stable; a temporary
+    // FreeBlockQueue would leave dangling fake-node pointers). Used to restore a
+    // pristine, contiguous popleft order after a fragmenting burst drains.
+    void rebuild(const std::vector<KVCacheBlock*>& blocks);
 
 private:
     KVCacheBlock fake_head{-1};
@@ -68,6 +73,14 @@ public:
                            size_t num_cached_blocks, size_t num_full_blocks,
                            const std::vector<uint64_t>& block_hashes);
     size_t get_num_free_blocks() const { return free_queue_.num_free_blocks; }
+    // [paged 0024 Fix-2] Total non-null blocks, and whether the pool is fully
+    // idle (every non-null block back in the free queue). defrag_free_queue()
+    // relinks the free queue into pristine ascending-block-id order; only valid
+    // when all_free() so no live request's block table is disturbed. Block hashes
+    // are preserved, so a warm committed prefix stays re-hittable.
+    size_t total_blocks() const { return blocks_.size(); }
+    bool   all_free()    const { return free_queue_.num_free_blocks + 1 == blocks_.size(); }
+    void   defrag_free_queue();
 
 private:
     bool maybe_evict_cached_block(KVCacheBlock* block);
@@ -94,6 +107,17 @@ public:
     std::vector<int64_t> slot_mapping(int seq_id, const std::vector<int>& positions) const;
     void free(int seq_id);
     int block_size() const { return block_size_; }
+
+    // [paged 0024 Fix-1] Reclaim the trailing blocks of seq_id beyond logical
+    // position n_keep: free every block at index >= ceil(n_keep/bs) (ref-counted,
+    // mirroring vLLM's free of a truncated block suffix). Called on a partial tail
+    // seq_rm [n_keep, end) so the manager's block accounting tracks the kv-cache
+    // exactly instead of stranding the blocks whose cells were just cleared.
+    void truncate(int seq_id, size_t n_keep);
+
+    // [paged 0024 Fix-2] When no live request holds a block, relink the free
+    // queue into pristine contiguous order (undo a burst's scrambled free order).
+    void defrag_free_pool() { if (pool_.all_free()) pool_.defrag_free_queue(); }
 
     // Prefix caching (win 3).
     static uint64_t hash_block(uint64_t parent_hash, const std::vector<int>& token_ids);

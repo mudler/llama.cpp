@@ -26,4 +26,10 @@ int ref_at(llama_context * ctx, llama_seq_id seq, int pos);
 // Number of free blocks in the unified stream-0 pool, or 0 if no manager.
 long num_free(llama_context * ctx);
 
+// [paged 0024] Total free blocks across every live paged manager (all caches /
+// streams). Wrapper-agnostic, so it reports the real pool for hybrid / iSWA
+// models whose outer memory is not a llama_kv_cache. Diagnostics only.
+long num_free_global();
+long num_managers();
+
 } // namespace paged_prefix_api

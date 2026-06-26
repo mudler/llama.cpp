@@ -425,6 +425,19 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    // [paged 0024 Fix-1] Reclaim trailing blocks on a partial TAIL truncation
+    // (p1 == MAX, p0 > 0). llama-server issues seq_rm(slot, n_past, -1) on every
+    // reused slot and before a cross-request prefix splice; the kv-cache frees the
+    // cells [p0, end) but, without this, the paged manager keeps owning those
+    // blocks - the reclamation gap that leaks and fragments the pool across a
+    // burst. truncate() frees the blocks beyond ceil(p0/bs) so the manager's
+    // accounting tracks the kv-cache exactly. Gated so LLAMA_PAGED_NO_RECLAIM
+    // restores the pre-fix behavior for A/B.
+    if (paged_alloc::active() && paged_alloc::reclaim_active() && seq_id >= 0 &&
+        p0 > 0 && p1 == std::numeric_limits<llama_pos>::max()) {
+        paged_alloc::truncate(this, (int) seq_to_stream[seq_id], (int) seq_id, (uint32_t) p0);
+    }
+
     if (seq_id >= 0) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];

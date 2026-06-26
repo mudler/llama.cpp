@@ -45,4 +45,12 @@ long num_free(llama_context * ctx) {
     return (long) paged_alloc::num_free((const void *) kv, /*stream=*/0);
 }
 
+long num_free_global() {
+    return (long) paged_alloc::num_free_global();
+}
+
+long num_managers() {
+    return (long) paged_alloc::num_managers();
+}
+
 } // namespace paged_prefix_api

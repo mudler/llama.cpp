@@ -32,6 +32,12 @@ namespace paged_alloc {
 // true iff env LLAMA_KV_PAGED is set (evaluated once).
 bool active();
 
+// [paged 0024] The burst-reclaim fix (truncate + defrag-on-empty + slot release)
+// is on by default whenever the paged engine is active. LLAMA_PAGED_NO_RECLAIM=1
+// restores the pre-fix behavior (no trailing-block reclaim, no compaction) for
+// A/B measurement. Evaluated once.
+bool reclaim_active();
+
 // Place n_tokens logical positions [base, base+n_tokens) of (cache,stream,seq)
 // on demand, appending their physical cell indices to `out`. pool_blocks =
 // cells.size()/block_size is the stream's block budget. Returns false (leaving
@@ -59,6 +65,12 @@ int64_t slot(const void * cache, int stream, int seq, int pos);
 void commit(const void * cache, int stream, int seq,
             const std::vector<int> & tokens, uint32_t block_size, uint32_t pool_blocks);
 
+// [paged 0024 Fix-1] Reclaim the trailing blocks of (cache,stream,seq) beyond
+// logical position n_keep (ref-counted), mirroring a partial kv-cache seq_rm
+// [n_keep, end). When the stream's pool empties as a result, its free queue is
+// defragged to pristine contiguous order (Fix-2). No-op if no manager exists.
+void truncate(const void * cache, int stream, int seq, uint32_t n_keep);
+
 // Return one sequence's blocks to the pool (ref-counted; sequence end).
 void release(const void * cache, int stream, int seq);
 
@@ -69,5 +81,11 @@ void release_all(const void * cache);
 // ref count of the block backing logical position `pos`, or -1 if unknown.
 int    ref_cnt_at(const void * cache, int stream, int seq, int pos, uint32_t block_size);
 size_t num_free(const void * cache, int stream);
+
+// [paged 0024] Total free blocks summed across every live manager (all caches /
+// streams). Wrapper-agnostic, so it reports the real pool for hybrid / iSWA
+// models whose outer memory is not a llama_kv_cache. Diagnostics only.
+size_t num_free_global();
+size_t num_managers();
 
 } // namespace paged_alloc

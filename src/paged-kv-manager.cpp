@@ -104,6 +104,22 @@ void FreeBlockQueue::prepend_n(const std::vector<KVCacheBlock*>& blocks) {
     num_free_blocks += blocks.size();
 }
 
+void FreeBlockQueue::rebuild(const std::vector<KVCacheBlock*>& blocks) {
+    // Relink the intrusive list using THIS queue's stable fake head/tail nodes.
+    num_free_blocks = blocks.size();
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        blocks[i]->prev_free = (i == 0)                  ? &fake_head : blocks[i - 1];
+        blocks[i]->next_free = (i + 1 < blocks.size())   ? blocks[i + 1] : &fake_tail;
+    }
+    if (!blocks.empty()) {
+        fake_head.next_free = blocks.front();
+        fake_tail.prev_free = blocks.back();
+    } else {
+        fake_head.next_free = &fake_tail;
+        fake_tail.prev_free = &fake_head;
+    }
+}
+
 std::vector<KVCacheBlock*> FreeBlockQueue::get_all_free_blocks() const {
     std::vector<KVCacheBlock*> ret;
     const KVCacheBlock* curr = fake_head.next_free;
@@ -199,6 +215,20 @@ void BlockPool::cache_full_blocks(const std::vector<KVCacheBlock*>& req_blocks,
     }
 }
 
+void BlockPool::defrag_free_queue() {
+    // Pool is fully idle: every non-null block is free (ref_cnt 0). Rebuild the
+    // free list in ascending block_id order so popleft hands out physically
+    // contiguous blocks again. Hashes / the content-cache map are left intact so
+    // a warm committed prefix stays re-hittable.
+    std::vector<KVCacheBlock*> ordered;
+    ordered.reserve(ptrs_.size());
+    for (KVCacheBlock* b : ptrs_) {
+        if (b->is_null) continue;
+        ordered.push_back(b);
+    }
+    free_queue_.rebuild(ordered);
+}
+
 // ---------------------------------------------------------------------------
 // PagedKVManager  (port of SingleTypeKVCacheManager / FullAttentionManager)
 // ---------------------------------------------------------------------------
@@ -248,6 +278,21 @@ void PagedKVManager::free(int seq_id) {
     std::vector<KVCacheBlock*> ordered(it->second.rbegin(), it->second.rend());
     pool_.free_blocks(ordered);
     req_to_blocks_.erase(it);
+}
+
+void PagedKVManager::truncate(int seq_id, size_t n_keep) {
+    auto it = req_to_blocks_.find(seq_id);
+    if (it == req_to_blocks_.end()) return;
+    auto & blocks = it->second;
+    const size_t keep = cdiv(n_keep, block_size_); // blocks covering [0, n_keep)
+    if (keep >= blocks.size()) return;             // nothing trailing to reclaim
+    // Free the trailing blocks [keep, end) tail-first (vLLM eviction order). Their
+    // cells were just cleared by the partial seq_rm, so they are safe to reuse.
+    std::vector<KVCacheBlock*> ordered(blocks.rbegin(),
+                                       blocks.rbegin() + (blocks.size() - keep));
+    pool_.free_blocks(ordered);
+    blocks.resize(keep);
+    if (blocks.empty()) req_to_blocks_.erase(it);
 }
 
 // FNV-1a chained block hash. Deterministic and prefix-sensitive; folds the parent

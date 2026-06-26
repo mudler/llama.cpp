@@ -509,6 +509,23 @@ struct server_slot {
 
             reset();
 
+            // [paged 0024 Fix-3] Return this finished slot's paged blocks to the
+            // pool promptly. Stock llama-server keeps an idle slot's KV for its own
+            // next-prompt cache, but under the paged engine that strands blocks in
+            // idle slots after a high-fan-out burst, so a later low-npl run sees a
+            // depleted, fragmented pool and its prefill collapses. prompt_clear()
+            // issues a full seq_rm (clearing the cells AND, via the paged hook,
+            // releasing + defragging the blocks) and clears the slot-local prompt
+            // cache so the next reuse recomputes from a pristine pool; cross-request
+            // reuse still works through the committed paged content cache. Gated on
+            // LLAMA_KV_PAGED (LLAMA_PAGED_NO_RECLAIM opts out for A/B); stock
+            // (paged off) is byte-identical.
+            static const bool paged_release_on_idle =
+                getenv("LLAMA_KV_PAGED") != nullptr && getenv("LLAMA_PAGED_NO_RECLAIM") == nullptr;
+            if (paged_release_on_idle && prompt.n_tokens() > 0) {
+                prompt_clear(false);
+            }
+
             callback_on_release(id);
         }
     }

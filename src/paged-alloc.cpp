@@ -14,6 +14,11 @@ bool active() {
     return a;
 }
 
+bool reclaim_active() {
+    static const bool off = (std::getenv("LLAMA_PAGED_NO_RECLAIM") != nullptr);
+    return !off;
+}
+
 static bool debug() {
     static const bool d = (std::getenv("LLAMA_KV_PAGED_DEBUG") != nullptr);
     return d;
@@ -124,12 +129,28 @@ void commit(const void * cache, int stream, int seq,
     }
 }
 
+void truncate(const void * cache, int stream, int seq, uint32_t n_keep) {
+    paged::PagedKVManager * mgr = find_mgr(cache, stream);
+    if (!mgr) {
+        return;
+    }
+    mgr->truncate(seq, (size_t) n_keep);     // Fix-1: reclaim trailing blocks
+    mgr->defrag_free_pool();                 // Fix-2: compact iff the pool emptied
+    if (debug()) {
+        fprintf(stderr, "[paged-alloc] truncate cache=%p stream=%d seq=%d keep<=%u (free=%zu)\n",
+                cache, stream, seq, n_keep, mgr->num_free_blocks());
+    }
+}
+
 void release(const void * cache, int stream, int seq) {
     paged::PagedKVManager * mgr = find_mgr(cache, stream);
     if (!mgr) {
         return;
     }
     mgr->free(seq); // ref-counted: shared blocks survive while another seq holds them
+    if (reclaim_active()) {
+        mgr->defrag_free_pool();             // Fix-2: compact iff the pool emptied
+    }
     if (debug()) {
         fprintf(stderr, "[paged-alloc] released cache=%p stream=%d seq=%d (free=%zu)\n",
                 cache, stream, seq, mgr->num_free_blocks());
@@ -161,6 +182,16 @@ int ref_cnt_at(const void * cache, int stream, int seq, int pos, uint32_t block_
 size_t num_free(const void * cache, int stream) {
     paged::PagedKVManager * mgr = find_mgr(cache, stream);
     return mgr ? mgr->num_free_blocks() : 0;
+}
+
+size_t num_free_global() {
+    size_t total = 0;
+    for (auto & kv : g_managers) total += kv.second->num_free_blocks();
+    return total;
+}
+
+size_t num_managers() {
+    return g_managers.size();
 }
 
 } // namespace paged_alloc
