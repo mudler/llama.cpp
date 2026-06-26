@@ -3291,7 +3291,17 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            bool mmid_needs_sync = !ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max;
+            // PROBE (bit-exact, env LLAMA_MOE_FORCE_GRAPHS): the grouped stream-k MMQ id-path is
+            // launched on-stream with no host sync (only the per-expert host-loop fallback syncs);
+            // when should_use_mmq() is true (Blackwell NVFP4 grouped path) the op is graph-safe
+            // even for ne[2] > mmvq_mmid_max, so graphs need not be disabled for the whole step.
+            if (mmid_needs_sync && ggml_is_quantized(node->src[0]->type) &&
+                getenv("LLAMA_MOE_FORCE_GRAPHS") != nullptr &&
+                ggml_cuda_should_use_mmq(node->src[0]->type, cc, node->src[1]->ne[2], node->src[0]->ne[2])) {
+                mmid_needs_sync = false;
+            }
+            if (mmid_needs_sync) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
