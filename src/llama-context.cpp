@@ -516,6 +516,45 @@ void llama_context::sched_reserve() {
         cparams.auto_fa = false;
     }
 
+    // RISKY-1 guard: the fused/in-place Gated Delta Net op and the discriminated
+    // SSM_CONV (which reuse GGML_OP_GATED_DELTA_NET / GGML_OP_SSM_CONV with extra
+    // src slots - a non-null src[3]/src[4] ring/ids discriminator) are only
+    // implemented for the CUDA-family backends (CUDA / HIP "ROCm" / "MUSA" - all
+    // built from the hipified ggml-cuda TU) and the CPU reference. Any other
+    // compute backend (Vulkan/SYCL/Metal/...) that supports *plain* SSM_CONV but
+    // ignores the discriminator src would silently run the WRONG conv. The
+    // upstream auto_fgdn device-mismatch check below only inspects
+    // GATED_DELTA_NET nodes, so couple the discriminated-SSM_CONV safety
+    // explicitly to the backend type here: keep the fused path enabled only when
+    // every non-CPU compute backend is CUDA-family. On CUDA this leaves the flags
+    // untouched, so the emitted decode graph is byte-identical.
+    if (cparams.fused_gdn_ar || cparams.fused_gdn_ch) {
+        bool fgdn_backend_ok = true;
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                // CPU reference handles the fused/discriminated ops
+                continue;
+            }
+            ggml_backend_reg_t reg  = ggml_backend_dev_backend_reg(dev);
+            const char *       name = reg ? ggml_backend_reg_name(reg) : "";
+            // GGML_CUDA_NAME is "CUDA" / "ROCm" (HIP) / "MUSA"; all three are the
+            // same ggml-cuda TU that carries the discriminated-op handling.
+            if (strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0) {
+                fgdn_backend_ok = false;
+                break;
+            }
+        }
+
+        if (!fgdn_backend_ok) {
+            cparams.fused_gdn_ar = false;
+            cparams.fused_gdn_ch = false;
+            cparams.auto_fgdn    = false;
+            LLAMA_LOG_INFO("%s: fused Gated Delta Net / discriminated SSM_CONV disabled "
+                    "(compute backend is not CUDA/HIP/CPU)\n", __func__);
+        }
+    }
+
     if (cparams.auto_fgdn) {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
 
