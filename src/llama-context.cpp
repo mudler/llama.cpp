@@ -1301,7 +1301,11 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+extern "C" void l5_add_setinp(double ns);
+extern "C" void l5_add_hostproc(double ns);
+static inline double l5c_now_ns(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (double)ts.tv_sec*1e9+(double)ts.tv_nsec; }
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    double _l5_t0=l5c_now_ns();
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1356,11 +1360,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        double _l5_si=l5c_now_ns();
         res->set_inputs(&ubatch);
+        l5_add_setinp(l5c_now_ns()-_l5_si);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    l5_add_hostproc(l5c_now_ns()-_l5_t0);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);

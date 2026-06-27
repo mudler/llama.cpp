@@ -451,4 +451,13 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    // [paged L5] within-step block-table cache. get_block_table() is called once
+    // per full-attention layer per decode step, but the cell layout (and hence
+    // the table) is identical across all layers of a step. Compute it on the
+    // first call and reuse the bytes for the rest; invalidated in apply() when
+    // the ubatch's slots are committed (the only host-side mutation per step).
+    mutable std::vector<int32_t> bt_cache;
+    mutable uint32_t bt_cache_n_blk = 0;
+    mutable bool     bt_cache_valid = false;
 };

@@ -8,6 +8,13 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <ctime>
+namespace { static inline double l5_now_ns(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (double)ts.tv_sec*1e9+(double)ts.tv_nsec; } }
+double g_l5_t_gbt=0, g_l5_t_setinp=0, g_l5_t_hostproc=0; long g_l5_n_gbt=0, g_l5_n_setinp=0, g_l5_n_hostproc=0;
+extern "C" void l5_add_setinp(double ns){ g_l5_t_setinp+=ns; g_l5_n_setinp++; }
+extern "C" void l5_add_hostproc(double ns){ g_l5_t_hostproc+=ns; g_l5_n_hostproc++; }
+namespace { struct L5Printer { ~L5Printer(){ fprintf(stderr,"[L5INSTR] get_block_table n=%ld sum=%.2fms mean=%.4fms | set_inputs n=%ld sum=%.2fms mean=%.4fms | hostproc n=%ld sum=%.2fms mean=%.4fms\n", g_l5_n_gbt, g_l5_t_gbt/1e6, g_l5_n_gbt? g_l5_t_gbt/1e6/g_l5_n_gbt:0.0, g_l5_n_setinp, g_l5_t_setinp/1e6, g_l5_n_setinp? g_l5_t_setinp/1e6/g_l5_n_setinp:0.0, g_l5_n_hostproc, g_l5_t_hostproc/1e6, g_l5_n_hostproc? g_l5_t_hostproc/1e6/g_l5_n_hostproc:0.0 ); } } g_l5_printer; }
+
 
 namespace paged_attn {
 
@@ -54,7 +61,9 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         GGML_UNUSED(ubatch);
         GGML_ASSERT(idxs && ggml_backend_buffer_is_host(idxs->buffer));
+        double _t=l5_now_ns();
         mctx->get_block_table((int32_t *) idxs->data, n_blk);
+        g_l5_t_gbt += l5_now_ns()-_t; g_l5_n_gbt++;
     }
 
     const llama_kv_cache_context * mctx;

@@ -2772,6 +2772,9 @@ bool llama_kv_cache_context::apply() {
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
+    // the cells for this ubatch just changed -> drop the cached block table
+    bt_cache_valid = false;
+
     return true;
 }
 
@@ -2814,7 +2817,30 @@ void llama_kv_cache_context::get_gather_idxs(int32_t * dst) const {
 }
 
 void llama_kv_cache_context::get_block_table(int32_t * dst, uint32_t n_blk) const {
-    kv->get_block_table(dst, n_blk, n_kv, sinfos[i_cur]);
+    const auto & sinfo = sinfos[i_cur];
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const size_t total = (size_t) ns * n_blk;
+
+    // within-step reuse: all full-attention layers of a step request the same
+    // table (same i_cur/n_blk, cells fixed since apply()). The bytes are
+    // identical to a fresh compute, so this is bit-exact.
+    static const bool nocache = (getenv("LLAMA_PAGED_NO_BT_CACHE") != nullptr);
+    if (nocache) {
+        kv->get_block_table(dst, n_blk, n_kv, sinfo);
+        return;
+    }
+
+    if (bt_cache_valid && bt_cache_n_blk == n_blk && bt_cache.size() == total) {
+        memcpy(dst, bt_cache.data(), total * sizeof(int32_t));
+        return;
+    }
+
+    kv->get_block_table(dst, n_blk, n_kv, sinfo);
+
+    bt_cache.resize(total);
+    memcpy(bt_cache.data(), dst, total * sizeof(int32_t));
+    bt_cache_n_blk = n_blk;
+    bt_cache_valid = true;
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
