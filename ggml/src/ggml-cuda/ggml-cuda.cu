@@ -3764,6 +3764,48 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         }
     }
 
+    // Fused residual-add + RMS norm + weight multiply. The transformer residual
+    // ADD feeds the next sublayer's RMS norm but is ALSO consumed by the later
+    // residual add (skip connection), so the ADD node is a graph output too; it
+    // cannot go through the single-use ggml_can_fuse() gate below. Recognize it
+    // here with ggml_can_fuse_subgraph, marking both the ADD (node_idx) and the
+    // final MUL (node_idx + 2) as outputs.
+    std::initializer_list<enum ggml_op> add_rms_norm_mul_ops = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+    if (is_equal(add_rms_norm_mul_ops, ops) &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx, node_idx + 2 })) {
+        const ggml_tensor * add      = cgraph->nodes[node_idx];
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+
+        // RMS norm must consume the residual-add output.
+        if (rms_norm->src[0] != add) {
+            return false;
+        }
+        // All operands F32 (rms norm / fused mul kernel only support F32).
+        if (add->src[0]->type != GGML_TYPE_F32 || add->src[1]->type != GGML_TYPE_F32 ||
+            add->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+            mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // The fused kernel computes h = a + b elementwise: same shape, no broadcast.
+        if (!ggml_are_same_shape(add->src[0], add->src[1])) {
+            return false;
+        }
+        // rms_norm kernel assumes contiguous rows for the residual operands and weight.
+        if (!ggml_is_contiguous(add->src[0]) || !ggml_is_contiguous(add->src[1])) {
+            return false;
+        }
+        if (!ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1])) {
+            return false;
+        }
+        // If rms_norm is the B operand of the mul, broadcast of the A operand is unsupported.
+        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+            return false;
+        }
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4284,6 +4326,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // Fused residual-add + RMS norm + weight multiply (bit-exact). Default ON;
+    // set LLAMA_FUSE_ADD_RMSNORM=0 for a clean A/B against the unfused path.
+    static const bool fuse_add_rmsnorm = [] {
+        const char * e = getenv("LLAMA_FUSE_ADD_RMSNORM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (fuse_add_rmsnorm &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        ggml_cuda_op_rms_norm_pre_add_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
