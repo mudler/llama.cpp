@@ -699,6 +699,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     this->mctx = mctx;
 
+    // [S1] refresh the attn sub-input's memory context so paged decode inputs
+    // (which read owner->mctx in their can_reuse, run later in the input list)
+    // pick up the live per-decode context on a reused graph. Harmless for the
+    // non-paged path: inp_attn->mctx is only consumed at graph-build time there.
+    inp_attn->mctx = mctx->get_attn();
+
     bool res = true;
 
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
@@ -2370,8 +2376,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * kq_mask_g   = kq_mask;
     ggml_tensor * block_table = nullptr;
     const bool is_decode = (q_cur->ne[2] == k->ne[3]); // 1 query token per stream
-    if (!(is_decode && paged_attn::in_kernel_decode(ctx0, res, mctx_cur, &k, &v, &kq_mask_g, &block_table))) {
-        paged_attn::gather(ctx0, res, mctx_cur, &k, &v, &kq_mask_g);
+    // [S1] pass `inp` (the attn input) as the reuse owner: its mctx is refreshed
+    // per-decode by attn_kv/mem_hybrid can_reuse, and the paged inputs read it so
+    // a reused graph picks up the live memory context.
+    if (!(is_decode && paged_attn::in_kernel_decode(ctx0, res, mctx_cur, inp, &k, &v, &kq_mask_g, &block_table))) {
+        paged_attn::gather(ctx0, res, mctx_cur, inp, &k, &v, &kq_mask_g);
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_g, sinks, v_mla, kq_scale, il, block_table);

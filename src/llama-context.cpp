@@ -1342,6 +1342,7 @@ bool llama_context::set_adapter_cvec(
 
 extern "C" void l5_add_setinp(double ns);
 extern "C" void l5_add_hostproc(double ns);
+extern "C" void l5_add_proc(int reused); // [S1] per-step graph-reuse counter
 static inline double l5c_now_ns(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (double)ts.tv_sec*1e9+(double)ts.tv_nsec; }
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     double _l5_t0=l5c_now_ns();
@@ -1369,7 +1370,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        l5_add_proc(1);
     } else {
+        l5_add_proc(0);
         res->reset();
 
         ggml_backend_sched_reset(sched.get());

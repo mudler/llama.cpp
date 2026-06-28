@@ -22,18 +22,31 @@ struct ggml_context;
 struct ggml_tensor;
 class  llm_graph_result;
 class  llama_kv_cache_context;
+class  llm_graph_input_attn_kv;
 
 namespace paged_attn {
 
 // true iff env LLAMA_KV_PAGED is set (evaluated once).
 bool active();
 
+// [S1] true iff the paged decode-graph reuse (layer-A can_reuse on the paged
+// inputs) is ENABLED. Default ON when active(); LLAMA_PAGED_NO_GRAPH_REUSE=1
+// forces it off (A/B probe / safety hatch). When off the paged inputs keep the
+// stock default can_reuse()==false, i.e. the pre-S1 behaviour (rebuild every
+// step). Bit-exact either way - reuse only skips the host-side graph rebuild,
+// set_inputs still re-runs every step.
+bool decode_graph_reuse();
+
 // Gather K, V and the kq_mask down to the current sequence's non-empty cells.
 // No-op (returns immediately) unless active(). On return *k, *v and *kq_mask
 // point at the compacted tensors; pass them straight to build_attn_mha.
+// `owner` is the attention input that owns the live (per-decode-refreshed) memory
+// context; the paged input reads owner->mctx in can_reuse so a reused graph picks
+// up the fresh context (see input_gather_idxs::can_reuse). May be null (no reuse).
 void gather(ggml_context * ctx0,
             llm_graph_result * res,
             const llama_kv_cache_context * mctx,
+            const llm_graph_input_attn_kv * owner,
             ggml_tensor ** k,
             ggml_tensor ** v,
             ggml_tensor ** kq_mask);
@@ -51,6 +64,7 @@ void gather(ggml_context * ctx0,
 bool in_kernel_decode(ggml_context * ctx0,
                       llm_graph_result * res,
                       const llama_kv_cache_context * mctx,
+                      const llm_graph_input_attn_kv * owner,
                       ggml_tensor ** k,
                       ggml_tensor ** v,
                       ggml_tensor ** kq_mask,
