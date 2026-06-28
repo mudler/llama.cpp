@@ -321,24 +321,29 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return false;
     }
 
-    // Paged prefill lever (patch 0033): OPTION-(a) route large-M NVFP4 dense GEMMs
-    // OFF the FP4-MMQ kernel and through the dequant->bf16 cuBLAS (nvjet)
-    // tensor-core path (ggml_cuda_op_mul_mat_cublas, NVFP4 bf16 branch). The
-    // scope premise was that FP4-MMQ is register-bound to ~3% of FP4 peak at
-    // large M. MEASURED ON GB10 THIS IS FALSE: FP4-MMQ at M=512..2048 beats
-    // dequant->bf16 cuBLAS by 29-49% (S_PP A/B in docs/PREFILL_GEMM_RESULTS.md),
-    // because bf16 tensor-core peak is ~half FP4 peak AND the per-step weight
-    // dequant + 4x bf16 weight traffic (~8x total vs the FP4 read) dominate and
-    // only partially amortize as M grows. The path is NUMERICALLY VALID and
-    // benign (greedy md5 byte-identical to FP4-MMQ; test-backend-ops passes), so
-    // it is kept as a validated, env-gated scaffold (for option-(b) native FP4
-    // large-M kernels and non-GB10 hardware), but DEFAULT-DISABLED (== stock).
-    // Set -D LLAMA_FP4_PREFILL_M=<M> or env LLAMA_FP4_PREFILL_M=<M> to A/B it;
-    // 0 (default) disables. Dense only (n_experts == 0).
+    // Paged prefill lever (patch 0033 -> 0034): route large-M NVFP4 prefill GEMMs to the
+    // native FP4-MMA (W4A4 OMMA) kernel in fp4-gemm.cu instead of the FP4-MMQ kernel.
+    //
+    //  - DENSE (n_experts == 0): the reroute happens earlier, in ggml_cuda_mul_mat's
+    //    ggml_cuda_fp4_prefill_should_engage() early check, which knows the N/K tile
+    //    divisibility. We deliberately do NOT force dense off MMQ here: if the native
+    //    kernel cannot take a shape (non-divisible N/K) MMQ stays the correct fallback,
+    //    NOT the rejected dequant->bf16 cuBLAS path.
+    //  - MoE (n_experts > 0): force the grouped FP4-MMQ id-path OFF at large M so
+    //    mul_mat_id falls to its per-expert host-sync loop, where each expert slice flows
+    //    back through ggml_cuda_mul_mat and hits the native kernel. CUDA graphs are
+    //    disabled for that prefill step (prefill is not graph-replayed); a graph-safe
+    //    grouped (ragged-batched) FP4-MMA kernel is the flagged follow-up. Decode keeps
+    //    ne12 <= threshold so the grouped graph-safe MMQ id-path (patch 0025) is untouched.
+    //
+    // The historical 0033 finding stands: dequant->bf16 cuBLAS LOSES to FP4-MMQ at large M
+    // (bf16 tensor-core peak is ~half FP4 peak + 8x weight traffic), which is exactly why
+    // the native FP4-MMA kernel (NMSE=0, ~103 TFLOP/s, beats cuBLAS bf16) replaces it here.
+    // Set -D LLAMA_FP4_PREFILL_M=<M> or env LLAMA_FP4_PREFILL_M=<M>; 0 (default) == stock.
 #ifndef LLAMA_FP4_PREFILL_M
 #define LLAMA_FP4_PREFILL_M 0
 #endif // LLAMA_FP4_PREFILL_M
-    if (type == GGML_TYPE_NVFP4 && n_experts == 0 && blackwell_mma_available(cc)) {
+    if (type == GGML_TYPE_NVFP4 && n_experts > 0 && blackwell_mma_available(cc)) {
         static const int64_t fp4_prefill_m = [] {
             const char * e = getenv("LLAMA_FP4_PREFILL_M");
             return e != nullptr ? (int64_t) atoll(e) : (int64_t) LLAMA_FP4_PREFILL_M;

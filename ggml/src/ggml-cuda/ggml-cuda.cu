@@ -25,6 +25,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fp4-gemm.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -2580,6 +2581,19 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+
+    // [paged patch 0034] Native NVFP4 (W4A4) large-M (prefill) FP4-MMA GEMM. Engages only
+    // when LLAMA_FP4_PREFILL_M>0 and M=src1->ne[1] exceeds it (and tile dims divide), so
+    // decode / small-M is byte-untouched. This also catches the per-expert MoE slices that
+    // flow through here from the mul_mat_id host-sync loop, routing each expert GEMM to the
+    // native kernel (see ggml_cuda_should_use_mmq's MoE gate in mmq.cu).
+    if (!split) {
+        const int cc_fp4 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (ggml_cuda_fp4_prefill_should_engage(src0, src1, dst, cc_fp4)) {
+            ggml_cuda_mul_mat_fp4_large_m(ctx, src0, src1, dst);
+            return;
+        }
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
