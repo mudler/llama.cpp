@@ -3138,11 +3138,55 @@ private:
         }
         int32_t n_prompt_budgeted = 0; // prompt tokens added to the batch this step (across slots)
 
+        // PAGED serving lever (patch 0041, S3): decode-shape-stable scheduling.
+        // Pairs with the S1 paged decode-graph reuse (patch 0040): S1 makes a
+        // pure-decode step graph-reusable, S3 makes the scheduler EMIT pure-decode
+        // steps. With continuous batching a co-batched prefill chunk inflates the
+        // step from n_tokens==D (pure decode) to D+P, which changes the ubatch
+        // shape and breaks layer-A graph reuse on EVERY step. S3 keeps prefill out
+        // of the decode step: while there is live decode load it runs pure-decode
+        // steps (reuse holds) and admits a prefill chunk only on a bounded cadence
+        // (every LLAMA_PAGED_PREFILL_PERIOD steps, default 8) or when no decode is
+        // active. The deferred prefill chunk still runs within a few steps, so
+        // prompt latency rises by at most (period-1) decode steps.
+        //
+        // BIT-EXACT: this only changes WHICH step a prompt chunk is admitted in.
+        // Each sequence's decode logits depend on its own tokens + its own KV only
+        // (the paged decode read is per-stream, attention is permutation-invariant
+        // over the co-batched set), so deferring another slot's prefill never
+        // changes a generating slot's output. Does not run in the single-sequence
+        // greedy md5 gate (that path is llama-completion, not update_slots).
+        //
+        // DEFAULT-OFF (A/B finding): an end-to-end A/B proved S3-on is a serving
+        // mistake. Deferring prefill admission on the period-8 cadence delays prompt
+        // admission: 2.5x worse TTFT (60s vs 24s at N=256) and 20-29% lower end-to-end
+        // throughput, with no end-to-end win at any concurrency. Its apparent
+        // decode_agg gain was a metric artifact (faster per-step decode bought by
+        // starving prefill). So the default prefers prompt prefill admission for good
+        // TTFT; S3 is opt-in (LLAMA_PAGED_DECODE_STABLE=1) only for decode-dominated,
+        // low-arrival traffic where TTFT is not a concern.
+        bool decode_only_step = false;
+        {
+            static const int s3_enabled = [](){
+                const char * e = getenv("LLAMA_PAGED_DECODE_STABLE");
+                return e ? atoi(e) : 0;                             // default OFF; opt-in via LLAMA_PAGED_DECODE_STABLE=1
+            }();
+            if (s3_enabled && n_decode_in_batch > 0) {
+                static const int s3_period = [](){ const char * e = getenv("LLAMA_PAGED_PREFILL_PERIOD"); int p = e ? atoi(e) : 8; return p > 0 ? p : 8; }();
+                static long s3_step = 0;
+                const bool prefill_due = (s3_step % s3_period) == 0;
+                s3_step++;
+                decode_only_step = !prefill_due;
+            }
+        }
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        // (patch 0041, S3) skip prompt admission on a pure-decode step to keep the
+        // decode batch shape reuse-stable
+        if ((params_base.cont_batching || batch.size() == 0) && !decode_only_step) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
