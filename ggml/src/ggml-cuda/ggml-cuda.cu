@@ -1660,7 +1660,47 @@ static void ggml_cuda_op_mul_mat_cublas(
         row_diff == src0->ne[1] &&
         dst->op_params[0] == GGML_PREC_DEFAULT;
 
-    if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+    if (supports_bf16 && src0->type == GGML_TYPE_NVFP4 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+        // Paged prefill lever (patch 0033): NVFP4 only reaches cuBLAS when
+        // ggml_cuda_should_use_mmq() returned false (large-M dense prefill).
+        // Dequant the FP4 weights to a TRANSIENT bf16 pool buffer and run a
+        // tensor-core bf16 GEMM (nvjet) instead of the f32 cublasSgemm fallback
+        // (no tensor cores) that the final else-branch would otherwise use. The
+        // weights are NOT cached as bf16 (pool scratch, freed at step end) so the
+        // model stays FP4-resident and the backend keeps its memory advantage.
+        ggml_cuda_pool_alloc<nv_bfloat16> src0_as_bf16(ctx.pool(id), row_diff*ne00);
+        const to_bf16_cuda_t to_bf16_cuda_src0 = ggml_get_to_bf16_cuda(GGML_TYPE_NVFP4);
+        GGML_ASSERT(to_bf16_cuda_src0 != nullptr);
+        to_bf16_cuda_src0(src0_dd_i, src0_as_bf16.get(), row_diff*ne00, stream);
+
+        ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
+        if (src1->type != GGML_TYPE_BF16) {
+            const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
+            GGML_ASSERT(to_bf16_cuda != nullptr);
+            size_t ne = src1_ncols*ne10;
+            src1_as_bf16.alloc(ne);
+            to_bf16_cuda(src1_ddf_i, src1_as_bf16.get(), ne, stream);
+        }
+        const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
+        const nv_bfloat16 * src0_ptr = src0_as_bf16.get();
+        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
+
+        const float alpha_f32 = 1.0f;
+        const float beta_f32  = 0.0f;
+
+        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        CUBLAS_CHECK(
+            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                    row_diff, src1_ncols, ne10,
+                    &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
+                                 src1_ptr,       CUDA_R_16BF, ne10,
+                    &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
+                    CUBLAS_COMPUTE_32F,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+        to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+    } else if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);

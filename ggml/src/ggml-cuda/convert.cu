@@ -704,6 +704,15 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_F16:
             return convert_unary_cont_cuda<half>;
+        // Paged prefill lever (patch 0033): NVFP4 -> bf16 dequant for the large-M
+        // dequant->bf16 cuBLAS (nvjet) prefill GEMM path in
+        // ggml_cuda_op_mul_mat_cublas. The dequant kernel is dst-type generic, so
+        // this instantiates the bf16 variant; bf16 (not f16) preserves the model's
+        // native bf16 activation range and avoids f16 overflow on large prefill
+        // activations. Only the new prefill path consumes this; nullptr-by-default
+        // for all other types is unchanged.
+        case GGML_TYPE_NVFP4:
+            return dequantize_row_nvfp4_cuda;
         default:
             return nullptr;
     }

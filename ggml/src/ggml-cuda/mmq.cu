@@ -321,6 +321,33 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return false;
     }
 
+    // Paged prefill lever (patch 0033): OPTION-(a) route large-M NVFP4 dense GEMMs
+    // OFF the FP4-MMQ kernel and through the dequant->bf16 cuBLAS (nvjet)
+    // tensor-core path (ggml_cuda_op_mul_mat_cublas, NVFP4 bf16 branch). The
+    // scope premise was that FP4-MMQ is register-bound to ~3% of FP4 peak at
+    // large M. MEASURED ON GB10 THIS IS FALSE: FP4-MMQ at M=512..2048 beats
+    // dequant->bf16 cuBLAS by 29-49% (S_PP A/B in docs/PREFILL_GEMM_RESULTS.md),
+    // because bf16 tensor-core peak is ~half FP4 peak AND the per-step weight
+    // dequant + 4x bf16 weight traffic (~8x total vs the FP4 read) dominate and
+    // only partially amortize as M grows. The path is NUMERICALLY VALID and
+    // benign (greedy md5 byte-identical to FP4-MMQ; test-backend-ops passes), so
+    // it is kept as a validated, env-gated scaffold (for option-(b) native FP4
+    // large-M kernels and non-GB10 hardware), but DEFAULT-DISABLED (== stock).
+    // Set -D LLAMA_FP4_PREFILL_M=<M> or env LLAMA_FP4_PREFILL_M=<M> to A/B it;
+    // 0 (default) disables. Dense only (n_experts == 0).
+#ifndef LLAMA_FP4_PREFILL_M
+#define LLAMA_FP4_PREFILL_M 0
+#endif // LLAMA_FP4_PREFILL_M
+    if (type == GGML_TYPE_NVFP4 && n_experts == 0 && blackwell_mma_available(cc)) {
+        static const int64_t fp4_prefill_m = [] {
+            const char * e = getenv("LLAMA_FP4_PREFILL_M");
+            return e != nullptr ? (int64_t) atoll(e) : (int64_t) LLAMA_FP4_PREFILL_M;
+        }();
+        if (fp4_prefill_m > 0 && ne11 > fp4_prefill_m) {
+            return false;
+        }
+    }
+
     if (turing_mma_available(cc)) {
         return true;
     }
