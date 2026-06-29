@@ -353,6 +353,23 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         }
     }
 
+    // Paged prefill lever (patch 0035): the Marlin-style W4A16 grouped MoE GEMM also needs the
+    // grouped FP4-MMQ id-path forced OFF at large M so mul_mat_id falls to the token-sorting
+    // host path, where the grouped W4A16 kernel is dispatched (in-register FP4->bf16 dequant +
+    // bf16 mma, ZERO activation-quant). Distinct env from 0034; default 0 == stock.
+#ifndef LLAMA_W4A16_PREFILL_M
+#define LLAMA_W4A16_PREFILL_M 0
+#endif // LLAMA_W4A16_PREFILL_M
+    if (type == GGML_TYPE_NVFP4 && n_experts > 0 && blackwell_mma_available(cc)) {
+        static const int64_t w4a16_prefill_m = [] {
+            const char * e = getenv("LLAMA_W4A16_PREFILL_M");
+            return e != nullptr ? (int64_t) atoll(e) : (int64_t) LLAMA_W4A16_PREFILL_M;
+        }();
+        if (w4a16_prefill_m > 0 && ne11 > w4a16_prefill_m) {
+            return false;
+        }
+    }
+
     if (turing_mma_available(cc)) {
         return true;
     }

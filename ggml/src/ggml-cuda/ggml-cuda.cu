@@ -26,6 +26,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fp4-gemm.cuh"
+#include "ggml-cuda/w4a16-gemm.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -2787,6 +2788,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
 
+    // [paged patch 0035] Marlin-style W4A16 grouped MoE prefill GEMM: one launch over the
+    // token-sorted activation buffer (src1_sorted, already f32 + sorted-by-expert above) with a
+    // per-tile expert map, in-register FP4->bf16 weight dequant + bf16 mma. Replaces the
+    // per-expert host-sync GEMM loop. Engages only when LLAMA_W4A16_PREFILL_M>0 and ne12>thr
+    // (large-M prefill); decode / non-NVFP4 keep the loop below (byte-identical to stock).
+    if (ggml_cuda_w4a16_moe_grouped_should_engage(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_id_w4a16_grouped(ctx, src0,
+            (const float *) src1_sorted.ptr, (float *) dst_sorted.ptr,
+            tokens_per_expert.data(), ne02, ne10, ne0, stream);
+    } else {
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -2834,6 +2845,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         src1_data_cur += src1_slice.nb[2];
         dst_data_cur  +=  dst_slice.nb[2];
+    }
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
