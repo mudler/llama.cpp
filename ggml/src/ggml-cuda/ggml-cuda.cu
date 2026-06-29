@@ -3358,12 +3358,22 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
             bool mmid_needs_sync = !ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max;
-            // PROBE (bit-exact, env LLAMA_MOE_FORCE_GRAPHS): the grouped stream-k MMQ id-path is
-            // launched on-stream with no host sync (only the per-expert host-loop fallback syncs);
-            // when should_use_mmq() is true (Blackwell NVFP4 grouped path) the op is graph-safe
-            // even for ne[2] > mmvq_mmid_max, so graphs need not be disabled for the whole step.
+            // [D1 / patch 0043] The grouped stream-k MMQ id-path (should_use_mmq()==true, e.g.
+            // Blackwell NVFP4) launches on-stream with NO host sync; only the per-expert
+            // host-loop fallback synchronizes the stream. So when this MUL_MAT_ID WILL take the
+            // grouped path, the whole decode step is graph-safe even for ne[2] > mmvq_mmid_max,
+            // and the full-step CUDA graph (incl. the MoE dispatch) can be REPLAYED instead of the
+            // host re-issuing every kernel every step. Patch 0025 proved this is bit-exact (graph
+            // replay re-issues identical kernels); D1 profiling confirmed the grouped path is what
+            // actually runs (no device->host routing readback), that steady decode is ~99% GPU-busy
+            // (not host-sync-bound), and that keeping the step graphed lifts throughput (npl32
+            // +13%, npl128 +1.9%). It is therefore ON BY DEFAULT for the grouped path now.
+            // should_use_mmq() is the exact guard: it returns FALSE for the large-M NVFP4 prefill
+            // (patch 0034) that deliberately drops to the per-expert host-sync loop, so PREFILL
+            // keeps graphs disabled (correct - that path syncs). Decode is untouched by 0034.
+            // LLAMA_MOE_NO_FORCE_GRAPHS=1 forces the conservative pre-0025 disable for A/B.
             if (mmid_needs_sync && ggml_is_quantized(node->src[0]->type) &&
-                getenv("LLAMA_MOE_FORCE_GRAPHS") != nullptr &&
+                getenv("LLAMA_MOE_NO_FORCE_GRAPHS") == nullptr &&
                 ggml_cuda_should_use_mmq(node->src[0]->type, cc, node->src[1]->ne[2], node->src[0]->ne[2])) {
                 mmid_needs_sync = false;
             }
