@@ -3816,6 +3816,60 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // Fused gated RMS norm: SiLU gate multiply over (RMS norm * weight), the
+    // gated-DeltaNet output norm `out = (rms_norm(x) * w) * silu(z)` of the Qwen3.6
+    // hybrid models (qwen35 / qwen35moe build_norm_gated). The model emits the gate
+    // multiply as mul(silu(z), normalized) (default; see LLAMA_FUSE_GATE_RMSNORM in
+    // build_norm_gated) so the chain forms the consecutive subgraph
+    // { SILU, RMS_NORM, MUL, MUL } - the gate z-projection is scheduled before the
+    // SILU, so the natural mul(normalized, silu) order leaves a GEMM between the
+    // weight MUL and the SILU and cannot be fused. The SILU (node_idx) reads an
+    // external gate and the final gate MUL (node_idx + 3) feeds the o_proj, so mark
+    // node_idx + 3 as the only output; the RMS_NORM (node_idx + 1) and weight MUL
+    // (node_idx + 2) are single-use within the subgraph.
+    std::initializer_list<enum ggml_op> rms_norm_gate_mul_ops = { GGML_OP_UNARY, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL };
+    if (is_equal(rms_norm_gate_mul_ops, ops) && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU &&
+        ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+        const ggml_tensor * silu     = cgraph->nodes[node_idx];
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * mul      = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * gate_mul = cgraph->nodes[node_idx + 3];
+
+        if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU) {
+            return false;
+        }
+        // The weight MUL must consume the RMS norm output; the gate MUL must
+        // consume both the weight MUL and the SILU output.
+        if (mul->src[0] != rms_norm && mul->src[1] != rms_norm) {
+            return false;
+        }
+        if ((gate_mul->src[0] != mul  && gate_mul->src[1] != mul) ||
+            (gate_mul->src[0] != silu && gate_mul->src[1] != silu)) {
+            return false;
+        }
+        // All operands F32 (rms norm / fused mul / silu kernel only support F32).
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 ||
+            mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            silu->src[0]->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 ||
+            gate_mul->src[0]->type != GGML_TYPE_F32 || gate_mul->src[1]->type != GGML_TYPE_F32 ||
+            gate_mul->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // If rms_norm is the B operand of the weight mul, broadcast of A is unsupported.
+        if (rms_norm == mul->src[1] && !ggml_are_same_shape(mul->src[0], rms_norm)) {
+            return false;
+        }
+        // The fused kernel reads contiguous rows for the norm input, the weight,
+        // and the gate, and writes a contiguous output.
+        if (!ggml_is_contiguous_rows(rms_norm->src[0]) ||
+            !ggml_is_contiguous_rows(mul->src[0]) || !ggml_is_contiguous_rows(mul->src[1]) ||
+            !ggml_is_contiguous_rows(silu->src[0]) ||
+            !ggml_is_contiguous_rows(gate_mul->src[0]) || !ggml_is_contiguous_rows(gate_mul->src[1])) {
+            return false;
+        }
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
@@ -4348,6 +4402,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_pre_add_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
+    }
+
+    // Fused gated RMS norm: RMS norm + weight multiply + SiLU-gated multiply
+    // (bit-exact). The Qwen3.6 gated-DeltaNet output norm. Default ON; set
+    // LLAMA_FUSE_GATE_RMSNORM=0 for a clean A/B against the unfused path.
+    static const bool fuse_gate_rmsnorm = [] {
+        const char * e = getenv("LLAMA_FUSE_GATE_RMSNORM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (fuse_gate_rmsnorm &&
+        ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL }, { GGML_UNARY_OP_SILU })) {
+        ggml_cuda_op_rms_norm_gate_mul(*cuda_ctx, cgraph->nodes[i + 1], cgraph->nodes[i + 2], node, cgraph->nodes[i + 3]);
+        return 3;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {

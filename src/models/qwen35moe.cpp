@@ -1,4 +1,5 @@
 #include "models.h"
+#include <cstdlib>
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -275,6 +276,21 @@ ggml_tensor * llama_model_qwen35moe::graph::build_norm_gated(
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
+    // Emit the gate multiply as mul(silu(z), normalized) so the gated-DeltaNet
+    // output-norm chain forms the consecutive subgraph { SILU, RMS_NORM, MUL, MUL }
+    // that the CUDA backend fuses into one rms_norm_gate_mul kernel (the normalized
+    // intermediate then never round-trips to HBM). The gate z-projection is scheduled
+    // before the SILU, so the natural mul(normalized, silu) order leaves a GEMM
+    // between the weight MUL and the SILU and is not fusable. Multiplication is
+    // commutative, so this is bit-exact vs mul(normalized, silu).
+    // LLAMA_FUSE_GATE_RMSNORM=0 keeps the original operand order (kernel fusion off).
+    static const bool fuse_gate_rmsnorm = [] {
+        const char * e = getenv("LLAMA_FUSE_GATE_RMSNORM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (fuse_gate_rmsnorm) {
+        return ggml_mul(ctx0, gated_silu, normalized);
+    }
     return ggml_mul(ctx0, normalized, gated_silu);
 }
 
