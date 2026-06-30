@@ -550,6 +550,23 @@ static void launch_gated_delta_net(
             launch_gdn_variant<64, KDA, keep_rs_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
             break;
         case 128: {
+            // Dense-prefill regression fix: gate patch 0022's column-fold geometry by per-call scan
+            // length. The (16,8) tile is a DECODE win (short scans: n_tokens small, n_seqs large) but a
+            // long-sequential-scan PREFILL loss - grid.z collapses from S_v/4=32 to S_v/(16*8)=1, so the
+            // SMs starve on the long scan (profiled: gated_delta_net +54% GPU time == the whole dense-
+            // prefill regression). Long scans (prefill) take stock's high-grid.z (4,1) geometry; short
+            // scans (decode) keep the (16,8) winner. Every {NW,CPW} variant is byte-identical (patch 0022
+            // proved md5-invariance across the ladder), so this stays greedy-md5 bit-exact. Default-on;
+            // GDN_PREFILL_NTOK tunes the crossover; the explicit GDN_NW/GDN_CPW sweep still wins (gate
+            // yields when either is set) so the one-build %peak A/B harness is unchanged.
+            static const int64_t gdn_prefill_ntok =
+                []{ const char * e = getenv("GDN_PREFILL_NTOK"); return e ? (int64_t) atoll(e) : (int64_t) 256; }();
+            static const bool gdn_nw_forced  = (getenv("GDN_NW")  != nullptr);
+            static const bool gdn_cpw_forced = (getenv("GDN_CPW") != nullptr);
+            if (n_tokens >= gdn_prefill_ntok && !gdn_nw_forced && !gdn_cpw_forced) {
+                launch_gdn_variant<128, KDA, keep_rs_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
+                break;
+            }
             // Bit-exact occupancy/coalescing retune (patch 0022): fold COLS_PER_WARP columns per warp
             // to raise per-warp memory-level parallelism on this bandwidth-bound recurrence. Default is
             // the measured winner; GDN_NW / GDN_CPW override it for the one-build %peak sweep (every
