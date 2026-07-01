@@ -19,6 +19,24 @@ struct ggml_cuda_mmq_shape {
     bool use_stream_k;
 };
 
+struct ggml_cuda_mmq_launch_shape {
+    int type;
+    bool is_moe;
+    int64_t ncols_dst;
+    int64_t ncols_max;
+    int mmq_x;
+    int mmq_y;
+    int ntx;
+    int nty;
+    int ntzw;
+    int ntiles_dst;
+    int nsm;
+    int tiles_nwaves;
+    int tiles_efficiency_percent;
+    int stream_k_blocks;
+    bool fixup_needed;
+};
+
 static inline ggml_cuda_mmq_shape ggml_cuda_mmq_shape_make(
         const int type, const bool is_moe, const int64_t ncols_dst, const int64_t nchannels_x,
         const int64_t ncols_max, const int mmq_x_max, const int mmq_x_lim, const int mmq_x_best,
@@ -46,6 +64,30 @@ static inline ggml_cuda_mmq_shape ggml_cuda_mmq_shape_make(
     };
 }
 
+static inline ggml_cuda_mmq_launch_shape ggml_cuda_mmq_launch_shape_make(
+        const int type, const bool is_moe, const int64_t ncols_dst, const int64_t ncols_max,
+        const int mmq_x, const int mmq_y, const int ntx, const int nty, const int ntzw,
+        const int ntiles_dst, const int nsm, const int tiles_nwaves, const int tiles_efficiency_percent,
+        const int stream_k_blocks, const bool fixup_needed) {
+    return {
+        type,
+        is_moe,
+        ncols_dst,
+        ncols_max,
+        mmq_x,
+        mmq_y,
+        ntx,
+        nty,
+        ntzw,
+        ntiles_dst,
+        nsm,
+        tiles_nwaves,
+        tiles_efficiency_percent,
+        stream_k_blocks,
+        fixup_needed,
+    };
+}
+
 static inline int ggml_cuda_mmq_shape_format(char * buf, const size_t size, const ggml_cuda_mmq_shape & shape) {
     return std::snprintf(buf, size,
         "type=%d moe=%d ncols_dst=%lld nchannels_x=%lld ncols_max=%lld "
@@ -63,4 +105,27 @@ static inline int ggml_cuda_mmq_shape_format(char * buf, const size_t size, cons
         shape.mmq_x_best,
         shape.mmq_y,
         shape.use_stream_k ? 1 : 0);
+}
+
+static inline int ggml_cuda_mmq_launch_shape_format(
+        char * buf, const size_t size, const ggml_cuda_mmq_launch_shape & shape) {
+    return std::snprintf(buf, size,
+        "type=%d moe=%d ncols_dst=%lld ncols_max=%lld mmq_x=%d mmq_y=%d "
+        "ntx=%d nty=%d ntzw=%d ntiles_dst=%d nsm=%d tiles_nwaves=%d "
+        "tiles_efficiency=%d stream_k_blocks=%d fixup=%d",
+        shape.type,
+        shape.is_moe ? 1 : 0,
+        (long long) shape.ncols_dst,
+        (long long) shape.ncols_max,
+        shape.mmq_x,
+        shape.mmq_y,
+        shape.ntx,
+        shape.nty,
+        shape.ntzw,
+        shape.ntiles_dst,
+        shape.nsm,
+        shape.tiles_nwaves,
+        shape.tiles_efficiency_percent,
+        shape.stream_k_blocks,
+        shape.fixup_needed ? 1 : 0);
 }

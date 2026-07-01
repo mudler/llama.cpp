@@ -3989,6 +3989,24 @@ static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int 
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, nwarps*warp_size*sizeof(int));
 }
 
+static inline int ggml_cuda_moe_mmq_shape_trace_limit() {
+    static const int limit = []() -> int {
+        const char * s = getenv("LLAMA_MOE_MMQ_SHAPE_TRACE");
+        if (s == nullptr || strcmp(s, "0") == 0) {
+            return 0;
+        }
+        const int parsed = atoi(s);
+        return parsed > 0 ? parsed : 256;
+    }();
+    return limit;
+}
+
+static inline bool ggml_cuda_moe_mmq_trace_take(std::atomic<int> & counter) {
+    const int trace_limit = ggml_cuda_moe_mmq_shape_trace_limit();
+    const int trace_index = trace_limit > 0 ? counter.fetch_add(1, std::memory_order_relaxed) : trace_limit;
+    return trace_index >= 0 && trace_index < trace_limit;
+}
+
 template <ggml_type type, int mmq_x>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -4053,6 +4071,19 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+
+    if (args.expert_bounds != nullptr) {
+        static std::atomic<int> trace_count{0};
+        if (ggml_cuda_moe_mmq_trace_take(trace_count)) {
+            char buf[256];
+            const ggml_cuda_mmq_launch_shape shape = ggml_cuda_mmq_launch_shape_make(
+                (int) type, true, args.ncols_dst, args.ncols_max, mmq_x, mmq_y,
+                ntx, nty, ntzw, ntiles_dst, nsm, tiles_nwaves, tiles_efficiency_percent,
+                block_nums_stream_k.x, fixup_needed);
+            ggml_cuda_mmq_launch_shape_format(buf, sizeof(buf), shape);
+            fprintf(stderr, "[LLAMA_MOE_MMQ_LAUNCH] %s\n", buf);
+        }
+    }
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -4167,18 +4198,6 @@ static inline int ggml_cuda_fp4_dense_mmq_x_cap() {
     return c;
 }
 
-static inline int ggml_cuda_moe_mmq_shape_trace_limit() {
-    static const int limit = []() -> int {
-        const char * s = getenv("LLAMA_MOE_MMQ_SHAPE_TRACE");
-        if (s == nullptr || strcmp(s, "0") == 0) {
-            return 0;
-        }
-        const int parsed = atoi(s);
-        return parsed > 0 ? parsed : 256;
-    }();
-    return limit;
-}
-
 template <ggml_type type>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id     = ggml_cuda_get_device();
@@ -4267,9 +4286,7 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
 
     if (args.expert_bounds != nullptr) {
         static std::atomic<int> trace_count{0};
-        const int trace_limit = ggml_cuda_moe_mmq_shape_trace_limit();
-        const int trace_index = trace_limit > 0 ? trace_count.fetch_add(1, std::memory_order_relaxed) : trace_limit;
-        if (trace_index >= 0 && trace_index < trace_limit) {
+        if (ggml_cuda_moe_mmq_trace_take(trace_count)) {
             char buf[256];
             const ggml_cuda_mmq_shape shape = ggml_cuda_mmq_shape_make(
                 (int) type, true, args.ncols_dst, args.nchannels_x, args.ncols_max,
