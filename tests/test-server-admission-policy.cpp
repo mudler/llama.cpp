@@ -16,6 +16,9 @@ int main() {
     require(!server_admission_should_defer_decode_for_ttft(true, true, 0), "first decode token is not deferred");
     require(server_admission_should_defer_decode_for_ttft(true, true, 1), "token 2+ decode is deferred");
     require(server_admission_should_defer_decode_for_ttft(true, true, 64), "later decode is deferred");
+    require(server_admission_should_defer_decode_for_ttft(true, true, 1, 0, 0), "zero cap means unlimited");
+    require(server_admission_should_defer_decode_for_ttft(true, true, 1, 3, 4), "below cap defers");
+    require(!server_admission_should_defer_decode_for_ttft(true, true, 1, 4, 4), "at cap stops deferring");
 
     return 0;
 }
