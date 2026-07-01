@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-admission-trace.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -913,12 +914,17 @@ public:
     server_chat_params chat_params;
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
+    const bool serving_trace_enabled = getenv("LLAMA_SERVING_TRACE") != nullptr;
+    server_admission_trace_totals serving_trace_totals;
 
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
 
     ~server_context_impl() {
+        if (serving_trace_enabled && serving_trace_totals.steps > 0) {
+            SRV_INF("%s\n", server_admission_trace_format(serving_trace_totals).c_str());
+        }
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -3153,6 +3159,14 @@ private:
             }
         }
         int32_t n_prompt_budgeted = 0; // prompt tokens added to the batch this step (across slots)
+        server_admission_trace_step serving_trace_step;
+        if (serving_trace_enabled) {
+            serving_trace_step.n_batch = n_batch;
+            serving_trace_step.n_ubatch = n_ubatch;
+            serving_trace_step.decode_tokens = n_decode_in_batch;
+            serving_trace_step.prefill_budget_step = prefill_budget_step;
+            serving_trace_step.prefill_cap_per_slot = prefill_cap_per_slot;
+        }
 
         // PAGED serving lever (patch 0041, S3): decode-shape-stable scheduling.
         // Pairs with the S1 paged decode-graph reuse (patch 0040): S1 makes a
@@ -3195,6 +3209,9 @@ private:
                 decode_only_step = !prefill_due;
             }
         }
+        if (serving_trace_enabled) {
+            serving_trace_step.decode_only_step = decode_only_step;
+        }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3227,6 +3244,11 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    const bool trace_slot_started = slot.state == SLOT_STATE_STARTED;
+                    if (serving_trace_enabled) {
+                        serving_trace_step.waiting_prompt_slots++;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -3709,6 +3731,13 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    if (serving_trace_enabled && n_tokens_cur > 0) {
+                        if (trace_slot_started) {
+                            serving_trace_step.started_prompt_slots++;
+                        } else {
+                            serving_trace_step.continued_prompt_slots++;
+                        }
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
@@ -3771,6 +3800,10 @@ private:
                     add_ok = false;
                 }
             });
+        }
+        if (serving_trace_enabled) {
+            serving_trace_step.prompt_tokens = n_prompt_budgeted;
+            server_admission_trace_accumulate(serving_trace_totals, serving_trace_step);
         }
     }
 

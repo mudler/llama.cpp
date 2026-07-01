@@ -13,6 +13,7 @@ add_library(${TARGET} STATIC
     server-queue.h
     server-common.cpp
     server-common.h
+    server-admission-trace.h
     server-context.cpp
     server-context.h
     server-stream.cpp
