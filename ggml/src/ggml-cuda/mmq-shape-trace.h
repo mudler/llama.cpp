@@ -129,6 +129,9 @@ struct ggml_cuda_cublas_route_shape {
     bool is_cdna;
     bool is_rdna4;
     bool is_volta;
+    const char * src0_name;
+    const char * src1_name;
+    const char * dst_name;
 };
 
 static inline const char * ggml_cuda_mmid_route_name(const ggml_cuda_mmid_route route) {
@@ -251,7 +254,7 @@ static inline ggml_cuda_cublas_route_shape ggml_cuda_cublas_route_shape_make(
         const int64_t ne00, const int64_t ne10, const int64_t ldc, const bool supports_bf16,
         const bool use_fp16, const bool fast_fp16, const bool force_fp32, const bool force_fp16,
         const bool src0_contig, const bool full_rows, const bool is_cdna, const bool is_rdna4,
-        const bool is_volta) {
+        const bool is_volta, const char * src0_name, const char * src1_name, const char * dst_name) {
     ggml_cuda_cublas_route route = GGML_CUDA_CUBLAS_ROUTE_SGEMM;
     if (supports_bf16 && type == 40 && src0_contig && full_rows) {
         route = GGML_CUDA_CUBLAS_ROUTE_NVFP4_BF16_TC;
@@ -284,6 +287,9 @@ static inline ggml_cuda_cublas_route_shape ggml_cuda_cublas_route_shape_make(
         is_cdna,
         is_rdna4,
         is_volta,
+        src0_name ? src0_name : "",
+        src1_name ? src1_name : "",
+        dst_name ? dst_name : "",
     };
 }
 
@@ -464,7 +470,8 @@ static inline int ggml_cuda_cublas_route_shape_format(
     return std::snprintf(buf, size,
         "route=%s type=%d src1_type=%d row_diff=%lld src1_ncols=%lld ne00=%lld ne10=%lld ldc=%lld "
         "supports_bf16=%d use_fp16=%d fast_fp16=%d force_fp32=%d force_fp16=%d "
-        "src0_contig=%d full_rows=%d is_cdna=%d is_rdna4=%d is_volta=%d",
+        "src0_contig=%d full_rows=%d is_cdna=%d is_rdna4=%d is_volta=%d "
+        "src0=%s src1=%s dst=%s",
         ggml_cuda_cublas_route_name(shape.route),
         shape.type,
         shape.src1_type,
@@ -482,7 +489,10 @@ static inline int ggml_cuda_cublas_route_shape_format(
         shape.full_rows ? 1 : 0,
         shape.is_cdna ? 1 : 0,
         shape.is_rdna4 ? 1 : 0,
-        shape.is_volta ? 1 : 0);
+        shape.is_volta ? 1 : 0,
+        shape.src0_name,
+        shape.src1_name,
+        shape.dst_name);
 }
 
 static inline int ggml_cuda_mmq_small_m_shape_format(

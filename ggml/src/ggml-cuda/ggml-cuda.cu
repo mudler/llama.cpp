@@ -1648,7 +1648,7 @@ static inline void ggml_cuda_cublas_route_trace(const ggml_cuda_cublas_route_sha
         return;
     }
 
-    char buf[320];
+    char buf[512];
     ggml_cuda_cublas_route_shape_format(buf, sizeof(buf), shape);
     fprintf(stderr, "[LLAMA_CUBLAS_ROUTE] %s\n", buf);
 }
@@ -1701,7 +1701,8 @@ static void ggml_cuda_op_mul_mat_cublas(
     ggml_cuda_cublas_route_trace(ggml_cuda_cublas_route_shape_make(
         src0->type, src1->type, row_diff, src1_ncols, ne00, ne10, ldc,
         supports_bf16, use_fp16, fast_fp16, force_fp32, force_fp16, src0_contig, full_rows,
-        GGML_CUDA_CC_IS_CDNA(cc), GGML_CUDA_CC_IS_RDNA4(cc), cc == GGML_CUDA_CC_VOLTA));
+        GGML_CUDA_CC_IS_CDNA(cc), GGML_CUDA_CC_IS_RDNA4(cc), cc == GGML_CUDA_CC_VOLTA,
+        src0->name, src1->name, dst->name));
 
     if (supports_bf16 && src0->type == GGML_TYPE_NVFP4 && src0_contig && full_rows) {
         // Paged prefill lever (patch 0033): NVFP4 only reaches cuBLAS when

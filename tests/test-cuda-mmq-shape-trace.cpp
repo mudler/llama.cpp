@@ -27,7 +27,7 @@ int main() {
     require(shape.n_active_est == 256, "active expert estimate is capped by expert count");
     require(shape.density == 4, "density is ceil(assignments / active experts)");
 
-    char buf[256];
+    char buf[512];
     const int n = ggml_cuda_mmq_shape_format(buf, sizeof(buf), shape);
 
     require(n > 0, "format returns byte count");
@@ -302,35 +302,38 @@ int main() {
         /* full_rows */ true,
         /* is_cdna */ false,
         /* is_rdna4 */ false,
-        /* is_volta */ false);
+        /* is_volta */ false,
+        /* src0_name */ "blk.0.proj.weight",
+        /* src1_name */ "blk.0.proj.inp",
+        /* dst_name */ "blk.0.proj.out");
 
     require(bf16_tc.route == GGML_CUDA_CUBLAS_ROUTE_BF16_TC,
         "cuBLAS records native BF16 tensor-core route");
 
     const ggml_cuda_cublas_route_shape nvfp4_bf16_tc = ggml_cuda_cublas_route_shape_make(
         /* type */ 40, 0, 128, 128, 1024, 1024, 128, true, false, true, false, false, true, true,
-        false, false, false);
+        false, false, false, "nvfp4.weight", "nvfp4.inp", "nvfp4.out");
 
     require(nvfp4_bf16_tc.route == GGML_CUDA_CUBLAS_ROUTE_NVFP4_BF16_TC,
         "cuBLAS records NVFP4 dequant-to-BF16 tensor-core route");
 
     const ggml_cuda_cublas_route_shape f16_tc_16f = ggml_cuda_cublas_route_shape_make(
         /* type */ 1, 0, 64, 64, 1024, 1024, 64, false, true, true, false, false, true, true,
-        false, false, false);
+        false, false, false, "f16.weight", "f16.inp", "f16.out");
 
     require(f16_tc_16f.route == GGML_CUDA_CUBLAS_ROUTE_F16_TC_16F,
         "cuBLAS records default FP16 tensor-core 16F compute route");
 
     const ggml_cuda_cublas_route_shape f16_tc_32f = ggml_cuda_cublas_route_shape_make(
         /* type */ 1, 0, 64, 64, 1024, 1024, 64, false, true, true, true, false, true, true,
-        false, false, false);
+        false, false, false, "f16.weight", "f16.inp", "f16.out");
 
     require(f16_tc_32f.route == GGML_CUDA_CUBLAS_ROUTE_F16_TC_32F,
         "cuBLAS records forced FP16 tensor-core 32F compute route");
 
     const ggml_cuda_cublas_route_shape sgemm = ggml_cuda_cublas_route_shape_make(
         /* type */ 0, 0, 12, 12, 1024, 1024, 12, false, false, true, false, false, true, true,
-        false, false, false);
+        false, false, false, "f32.weight", "f32.inp", "f32.out");
 
     require(sgemm.route == GGML_CUDA_CUBLAS_ROUTE_SGEMM,
         "cuBLAS records SGEMM fallback route");
@@ -346,6 +349,9 @@ int main() {
     require(std::strstr(buf, "supports_bf16=1") != nullptr, "cuBLAS trace includes BF16 predicate");
     require(std::strstr(buf, "force_fp32=0") != nullptr, "cuBLAS trace includes forced compute predicate");
     require(std::strstr(buf, "src0_contig=1") != nullptr, "cuBLAS trace includes contiguity predicate");
+    require(std::strstr(buf, "src0=blk.0.proj.weight") != nullptr, "cuBLAS trace includes src0 name");
+    require(std::strstr(buf, "src1=blk.0.proj.inp") != nullptr, "cuBLAS trace includes src1 name");
+    require(std::strstr(buf, "dst=blk.0.proj.out") != nullptr, "cuBLAS trace includes dst name");
 
     return 0;
 }
