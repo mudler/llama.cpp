@@ -73,5 +73,40 @@ int main() {
     require(std::strstr(buf, "stream_k_blocks=16") != nullptr, "launch trace includes actual stream-k block count");
     require(std::strstr(buf, "fixup=1") != nullptr, "launch trace includes fixup flag");
 
+    const ggml_cuda_mmq_small_m_shape small_m = ggml_cuda_mmq_small_m_shape_make(
+        /* is_moe */ true,
+        /* ncols_dst */ 1024,
+        /* nchannels_x */ 256,
+        /* ncols_max */ 128,
+        /* mmq_x_best */ 64,
+        /* use_stream_k */ true);
+
+    require(small_m.is_candidate, "decode-like low-density MoE shape is a small-M candidate");
+    require(small_m.n_active_est == 256, "small-M active estimate is capped by expert count");
+    require(small_m.density == 4, "small-M density is ceil(assignments / active experts)");
+
+    require(!ggml_cuda_mmq_small_m_shape_make(
+        /* is_moe */ false, 1024, 256, 128, 64, true).is_candidate,
+        "dense shape is excluded");
+    require(!ggml_cuda_mmq_small_m_shape_make(
+        /* is_moe */ true, 4096, 256, 512, 128, true).is_candidate,
+        "prefill-like shape is excluded");
+    require(!ggml_cuda_mmq_small_m_shape_make(
+        /* is_moe */ true, 4096, 256, 128, 64, true).is_candidate,
+        "high-density shape is excluded");
+    require(!ggml_cuda_mmq_small_m_shape_make(
+        /* is_moe */ true, 1024, 256, 128, 128, true).is_candidate,
+        "large selected tile is excluded");
+    require(!ggml_cuda_mmq_small_m_shape_make(
+        /* is_moe */ true, 1024, 256, 128, 64, false).is_candidate,
+        "non-stream-k shape is excluded");
+
+    const int small_m_n = ggml_cuda_mmq_small_m_shape_format(buf, sizeof(buf), small_m);
+
+    require(small_m_n > 0, "small-M format returns byte count");
+    require(std::strstr(buf, "candidate=1") != nullptr, "small-M trace includes candidate flag");
+    require(std::strstr(buf, "density=4") != nullptr, "small-M trace includes density");
+    require(std::strstr(buf, "mmq_x_best=64") != nullptr, "small-M trace includes selected tile");
+
     return 0;
 }

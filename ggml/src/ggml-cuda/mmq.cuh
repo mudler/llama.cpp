@@ -4007,6 +4007,24 @@ static inline bool ggml_cuda_moe_mmq_trace_take(std::atomic<int> & counter) {
     return trace_index >= 0 && trace_index < trace_limit;
 }
 
+static inline int ggml_cuda_moe_mmq_small_m_trace_limit() {
+    static const int limit = []() -> int {
+        const char * s = getenv("LLAMA_MOE_MMQ_SMALL_M_TRACE");
+        if (s == nullptr || strcmp(s, "0") == 0) {
+            return 0;
+        }
+        const int parsed = atoi(s);
+        return parsed > 0 ? parsed : 256;
+    }();
+    return limit;
+}
+
+static inline bool ggml_cuda_moe_mmq_small_m_trace_take(std::atomic<int> & counter) {
+    const int trace_limit = ggml_cuda_moe_mmq_small_m_trace_limit();
+    const int trace_index = trace_limit > 0 ? counter.fetch_add(1, std::memory_order_relaxed) : trace_limit;
+    return trace_index >= 0 && trace_index < trace_limit;
+}
+
 template <ggml_type type, int mmq_x>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
@@ -4293,6 +4311,15 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
                 mmq_x_max, mmq_x_lim, mmq_x_best, mmq_y, args.use_stream_k);
             ggml_cuda_mmq_shape_format(buf, sizeof(buf), shape);
             fprintf(stderr, "[LLAMA_MOE_MMQ_SHAPE] %s\n", buf);
+        }
+
+        static std::atomic<int> small_m_trace_count{0};
+        const ggml_cuda_mmq_small_m_shape small_m = ggml_cuda_mmq_small_m_shape_make(
+            true, args.ncols_dst, args.nchannels_x, args.ncols_max, mmq_x_best, args.use_stream_k);
+        if (small_m.is_candidate && ggml_cuda_moe_mmq_small_m_trace_take(small_m_trace_count)) {
+            char buf[256];
+            ggml_cuda_mmq_small_m_shape_format(buf, sizeof(buf), small_m);
+            fprintf(stderr, "[LLAMA_MOE_MMQ_SMALL_M] %s\n", buf);
         }
     }
 
