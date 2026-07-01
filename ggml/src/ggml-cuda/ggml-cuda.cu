@@ -2647,6 +2647,52 @@ static inline void ggml_cuda_mul_mat_route_trace(const ggml_cuda_mul_mat_route_s
     fprintf(stderr, "[LLAMA_MUL_MAT_ROUTE] %s\n", buf);
 }
 
+static inline int ggml_cuda_layout_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_LAYOUT_TRACE");
+        return s ? atoi(s) : 0;
+    }();
+
+    return value;
+}
+
+static inline const char * ggml_cuda_trace_tensor_name(const ggml_tensor * t) {
+    return t != nullptr && t->name[0] != '\0' ? t->name : "-";
+}
+
+static inline void ggml_cuda_layout_trace(const ggml_tensor * dst, const char * route) {
+    const int trace_limit = ggml_cuda_layout_trace_limit();
+    if (trace_limit <= 0) {
+        return;
+    }
+
+    static std::atomic<int> trace_count{0};
+    const int trace_idx = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (trace_idx >= trace_limit) {
+        return;
+    }
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const bool src0_cont = src0 != nullptr && ggml_is_contiguous(src0);
+    const bool src1_cont = src1 != nullptr && ggml_is_contiguous(src1);
+    const bool dst_cont  = ggml_is_contiguous(dst);
+
+    fprintf(stderr,
+        "[LLAMA_LAYOUT_TRACE] route=%s op=%s dst=%s dst_type=%s dst_ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+        " dst_contig=%d src0=%s src0_type=%s src0_ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+        " src0_contig=%d src1=%s src1_type=%s src1_ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+        " src1_contig=%d\n",
+        route, ggml_op_name(dst->op), ggml_cuda_trace_tensor_name(dst), ggml_type_name(dst->type),
+        dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], dst_cont ? 1 : 0,
+        ggml_cuda_trace_tensor_name(src0), src0 != nullptr ? ggml_type_name(src0->type) : "-",
+        src0 != nullptr ? src0->ne[0] : 0, src0 != nullptr ? src0->ne[1] : 0,
+        src0 != nullptr ? src0->ne[2] : 0, src0 != nullptr ? src0->ne[3] : 0, src0_cont ? 1 : 0,
+        ggml_cuda_trace_tensor_name(src1), src1 != nullptr ? ggml_type_name(src1->type) : "-",
+        src1 != nullptr ? src1->ne[0] : 0, src1 != nullptr ? src1->ne[1] : 0,
+        src1 != nullptr ? src1->ne[2] : 0, src1 != nullptr ? src1->ne[3] : 0, src1_cont ? 1 : 0);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
@@ -2992,6 +3038,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_repeat_back(ctx, dst);
             break;
         case GGML_OP_GET_ROWS:
+            ggml_cuda_layout_trace(dst, "get_rows");
             ggml_cuda_op_get_rows(ctx, dst);
             break;
         case GGML_OP_GET_ROWS_BACK:
@@ -3004,12 +3051,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_set(ctx, dst);
             break;
         case GGML_OP_DUP:
+            ggml_cuda_layout_trace(dst, "dup");
             ggml_cuda_dup(ctx, dst);
             break;
         case GGML_OP_CPY:
+            ggml_cuda_layout_trace(dst, "cpy");
             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
             break;
         case GGML_OP_CONT:
+            ggml_cuda_layout_trace(dst, "cont");
             ggml_cuda_dup(ctx, dst);
             break;
         case GGML_OP_ADD:
@@ -3137,6 +3187,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_l2_norm(ctx, dst);
             break;
         case GGML_OP_CONCAT:
+            ggml_cuda_layout_trace(dst, "concat");
             ggml_cuda_op_concat(ctx, dst);
             break;
         case GGML_OP_UPSCALE:
