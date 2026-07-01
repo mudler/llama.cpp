@@ -18,3 +18,18 @@ static inline bool server_admission_should_defer_decode_for_ttft(
     return server_admission_should_defer_decode_for_ttft(enabled, prompt_waiting, n_decoded) &&
         (max_deferred_decode_slots <= 0 || deferred_decode_slots < max_deferred_decode_slots);
 }
+
+static inline bool server_admission_should_defer_decode_for_ttft(
+        const bool enabled,
+        const int32_t waiting_prompt_slots,
+        const int32_t n_decoded,
+        const int32_t deferred_decode_slots,
+        const int32_t max_deferred_decode_slots,
+        const int32_t min_waiting_prompt_slots) {
+    return server_admission_should_defer_decode_for_ttft(
+            enabled,
+            waiting_prompt_slots > 0 && (min_waiting_prompt_slots <= 0 || waiting_prompt_slots >= min_waiting_prompt_slots),
+            n_decoded,
+            deferred_decode_slots,
+            max_deferred_decode_slots);
+}

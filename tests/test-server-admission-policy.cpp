@@ -19,6 +19,9 @@ int main() {
     require(server_admission_should_defer_decode_for_ttft(true, true, 1, 0, 0), "zero cap means unlimited");
     require(server_admission_should_defer_decode_for_ttft(true, true, 1, 3, 4), "below cap defers");
     require(!server_admission_should_defer_decode_for_ttft(true, true, 1, 4, 4), "at cap stops deferring");
+    require(server_admission_should_defer_decode_for_ttft(true, 8, 1, 0, 0, 0), "zero waiting threshold defers");
+    require(server_admission_should_defer_decode_for_ttft(true, 8, 1, 0, 0, 8), "at waiting threshold defers");
+    require(!server_admission_should_defer_decode_for_ttft(true, 7, 1, 0, 0, 8), "below waiting threshold does not defer");
 
     return 0;
 }

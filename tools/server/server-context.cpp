@@ -2972,13 +2972,17 @@ private:
             const char * e = getenv("LLAMA_TTFT_PREFILL_FIRST_MAX_DEFER");
             return e ? std::max(0, atoi(e)) : 0;
         }();
+        const int32_t ttft_min_waiting = []() {
+            const char * e = getenv("LLAMA_TTFT_PREFILL_FIRST_MIN_WAITING");
+            return e ? std::max(0, atoi(e)) : 0;
+        }();
 
-        bool ttft_prompt_waiting = false;
+        int32_t ttft_waiting_prompt_slots = 0;
         if (ttft_prefill_first) {
             iterate(slots, [&](server_slot & slot) {
-                ttft_prompt_waiting = ttft_prompt_waiting ||
-                    slot.state == SLOT_STATE_STARTED ||
-                    slot.state == SLOT_STATE_PROCESSING_PROMPT;
+                if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                    ttft_waiting_prompt_slots++;
+                }
             });
         }
 
@@ -2993,10 +2997,11 @@ private:
 
             if (server_admission_should_defer_decode_for_ttft(
                         ttft_prefill_first,
-                        ttft_prompt_waiting,
+                        ttft_waiting_prompt_slots,
                         slot.n_decoded,
                         ttft_deferred_decode_slots_step,
-                        ttft_max_defer)) {
+                        ttft_max_defer,
+                        ttft_min_waiting)) {
                 ttft_deferred_decode_slots_step++;
                 if (serving_trace_enabled) {
                     serving_trace_step.ttft_deferred_decode_slots++;
