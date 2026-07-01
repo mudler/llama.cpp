@@ -6496,8 +6496,8 @@ struct ggml_tensor * ggml_gated_delta_net_inplace_ids(
     GGML_ASSERT(v->type    == GGML_TYPE_F32);
     GGML_ASSERT(g->type    == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
-    GGML_ASSERT(state->type == GGML_TYPE_F32);
-    GGML_ASSERT(state_dst != NULL && state_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32 || state->type == GGML_TYPE_BF16);
+    GGML_ASSERT(state_dst != NULL && state_dst->type == state->type);
     GGML_ASSERT(ids != NULL && ids->type == GGML_TYPE_I32);
 
     const int64_t S_v      = v->ne[0];
@@ -6517,7 +6517,7 @@ struct ggml_tensor * ggml_gated_delta_net_inplace_ids(
     // state_dst holds the per-seq final state contiguously: [S_v*S_v*H, >= n_seqs]
     GGML_ASSERT(state_dst->ne[0] == S_v * S_v * H);
     GGML_ASSERT(state_dst->ne[1] >= n_seqs);
-    GGML_ASSERT(state_dst->nb[0] == sizeof(float));
+    GGML_ASSERT(state_dst->nb[0] == ggml_type_size(state_dst->type));
 
     // ids: per-seq source slot into the full cache (s_copy_main)
     GGML_ASSERT(ids->ne[0] >= n_seqs);

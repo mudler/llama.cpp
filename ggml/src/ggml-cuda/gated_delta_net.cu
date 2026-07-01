@@ -1,5 +1,6 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/convert.cuh"
 
 #include <climits>
 #include <cstdlib>
@@ -9,8 +10,9 @@
 // Step 2: gather only the NON-identity sequences' prior recurrent state from the full cache into a
 // disjoint scratch buffer. Identity sequences (ids[s] == rs_head + s) are read in place from the
 // destination slot by the recurrence kernel and are skipped here. One block per sequence.
-__global__ void gdn_gather_nonident_kernel(const float * cache, const int32_t * ids, int rs_head,
-                                           float * scratch, int64_t D, int n_seqs) {
+template <typename state_t>
+__global__ void gdn_gather_nonident_kernel(const state_t * cache, const int32_t * ids, int rs_head,
+                                           state_t * scratch, int64_t D, int n_seqs) {
     const int s = blockIdx.x;
     if (s >= n_seqs) {
         return;
@@ -19,15 +21,16 @@ __global__ void gdn_gather_nonident_kernel(const float * cache, const int32_t * 
     if (r == rs_head + s) {
         return; // identity: prior state already lives in the in-place destination slot
     }
-    const float * src = cache   + (int64_t) r * D;
-    float *       dst = scratch + (int64_t) s * D;
+    const state_t * src = cache   + (int64_t) r * D;
+    state_t *       dst = scratch + (int64_t) s * D;
     for (int64_t i = threadIdx.x; i < D; i += blockDim.x) {
         dst[i] = src[i];
     }
 }
 
-static void ggml_cuda_gdn_gather_nonident(const float * cache, const int32_t * ids, int rs_head,
-                                          float * scratch, int64_t D, int64_t n_seqs, cudaStream_t stream) {
+template <typename state_t>
+static void ggml_cuda_gdn_gather_nonident(const state_t * cache, const int32_t * ids, int rs_head,
+                                          state_t * scratch, int64_t D, int64_t n_seqs, cudaStream_t stream) {
     if (n_seqs <= 0) {
         return;
     }
@@ -48,14 +51,14 @@ static void ggml_cuda_gdn_gather_nonident(const float * cache, const int32_t * i
 // to hide each other's shfl latency) which covers more DRAM latency on this bandwidth-bound kernel.
 // Every individual global access stays IDENTICALLY coalesced (32 consecutive lanes -> one 128B
 // sector), so this is a latency-coverage / scheduling win, not a coalescing change.
-template <int S_v, bool KDA, bool keep_rs_t, int NUM_WARPS = 4, int COLS_PER_WARP = 1, int MIN_BLOCKS = 2>
+template <int S_v, bool KDA, bool keep_rs_t, typename state_t = float, int NUM_WARPS = 4, int COLS_PER_WARP = 1, int MIN_BLOCKS = 2>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * NUM_WARPS, MIN_BLOCKS)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
                                      const float * g,
                                      const float * beta,
-                                     const float * curr_state,
+                                     const state_t * curr_state,
                                      float *       dst,
                                      int64_t       H,
                                      int64_t       n_tokens,
@@ -73,7 +76,7 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   rq3_magic,
                                      float         scale,
                                      int           K,
-                                     float *       state_dst,
+                                     state_t *     state_dst,
                                      const int32_t * ids,
                                      int           rs_head) {
     const uint32_t h_idx    = blockIdx.x;
@@ -90,7 +93,10 @@ gated_delta_net_cuda(const float * q,
     // when state_dst is provided (in-place decode write-back) the final recurrent state is written
     // directly into the persistent cache view instead of being appended to the op output; this
     // eliminates the per-layer per-step D2D state copy-back. Only used when keep_rs_t == false.
-    float *       state            = (state_dst != nullptr) ? state_dst : (dst + attn_score_elems);
+    state_t *     state            = state_dst;
+    if constexpr (std::is_same_v<state_t, float>) {
+        state = (state_dst != nullptr) ? state_dst : (state_t *) (dst + attn_score_elems);
+    }
 
     // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
     // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
@@ -103,7 +109,7 @@ gated_delta_net_cuda(const float * q,
     // (curr_state). state_in_offset == state_out_offset, so both bases use the same per-(seq,head)
     // offset. The whole s0 is loaded into registers before the new state is written, so reading and
     // writing the same slot per block (identity) is race-free.
-    const float * read_state = (ids != nullptr && ids[sequence] == rs_head + (int) sequence)
+    const state_t * read_state = (ids != nullptr && ids[sequence] == rs_head + (int) sequence)
         ? state_dst : curr_state;
     read_state += state_in_offset;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
@@ -118,11 +124,11 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
     for (int cc = 0; cc < COLS_PER_WARP; cc++) {
         const int     col = col_base + cc * NUM_WARPS;
-        const float * rs  = read_state + col * S_v;
+        const state_t * rs  = read_state + col * S_v;
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i   = r * warp_size + lane;
-            s_shard[cc][r] = rs[i];
+            s_shard[cc][r] = ggml_cuda_cast<float>(rs[i]);
         }
     }
 
@@ -245,7 +251,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i          = r * warp_size + lane;
-                state[col * S_v + i] = s_shard[cc][r];
+                state[col * S_v + i] = ggml_cuda_cast<state_t>(s_shard[cc][r]);
             }
         }
     }
@@ -261,11 +267,11 @@ gated_delta_net_cuda(const float * q,
 #define GDN_DEFAULT_CPW 8
 #endif
 
-template <int S_v, bool KDA, bool keep_rs_t, int NUM_WARPS, int COLS_PER_WARP, int MIN_BLOCKS>
+template <int S_v, bool KDA, bool keep_rs_t, typename state_t, int NUM_WARPS, int COLS_PER_WARP, int MIN_BLOCKS>
 static void launch_gdn_variant(
         const float * q_d, const float * k_d, const float * v_d,
-        const float * g_d, const float * b_d, const float * s_d,
-        float * dst_d, float * state_dst_d, const int32_t * ids_d, int rs_head,
+        const float * g_d, const float * b_d, const state_t * s_d,
+        float * dst_d, state_t * state_dst_d, const int32_t * ids_d, int rs_head,
         int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1, int64_t sq2, int64_t sq3,
         int64_t sv1, int64_t sv2, int64_t sv3,
@@ -276,7 +282,7 @@ static void launch_gdn_variant(
     dim3 grid_dims(H, n_seqs, S_v / (NUM_WARPS * COLS_PER_WARP));
     dim3 block_dims(warp_size <= S_v ? warp_size : S_v, NUM_WARPS, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
-    ggml_cuda_kernel_launch(gated_delta_net_cuda<S_v, KDA, keep_rs_t, NUM_WARPS, COLS_PER_WARP, MIN_BLOCKS>, launch_params,
+    ggml_cuda_kernel_launch(gated_delta_net_cuda<S_v, KDA, keep_rs_t, state_t, NUM_WARPS, COLS_PER_WARP, MIN_BLOCKS>, launch_params,
         q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
         n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
         sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K, state_dst_d, ids_d, rs_head);
@@ -892,11 +898,11 @@ static void launch_gdn_chunked(
         neqk1_magic, rq3_magic, scale, state_dst_d, ids_d, rs_head);
 }
 
-template <bool KDA, bool keep_rs_t>
+template <bool KDA, bool keep_rs_t, typename state_t = float>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
-        const float * g_d, const float * b_d, const float * s_d,
-        float * dst_d, float * state_dst_d,
+        const float * g_d, const float * b_d, const state_t * s_d,
+        float * dst_d, state_t * state_dst_d,
         const int32_t * ids_d, int rs_head,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1,   int64_t sq2, int64_t sq3,
@@ -915,7 +921,7 @@ static void launch_gated_delta_net(
     // head dim (S_v==128) and a prefill token threshold; decode (n_tokens small) keeps the tuned
     // sequential recurrence. Mathematically equivalent up to FP reduction order (NEW per-path md5;
     // validated benign by test-backend-ops NMSE + greedy output). Toggle: GDN_CHUNK_OFF / GDN_CHUNK_MIN.
-    if constexpr (!KDA && !keep_rs_t) {
+    if constexpr (!KDA && !keep_rs_t && std::is_same_v<state_t, float>) {
         // DEFAULT-ON UNDER PAGED KV (f32-only re-port of patch 0044's M5). The M5 tensor-core path
         // (GDN_TC=5: full-TC form-T solve + state-update mma, state in the 64KB smem buffer, C=16)
         // is greedy-bit-exact (per-path md5 == the sequential canonical on the short gate prompt)
@@ -973,13 +979,13 @@ static void launch_gated_delta_net(
 
     switch (S_v) {
         case 16:
-            launch_gdn_variant<16, KDA, keep_rs_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
+            launch_gdn_variant<16, KDA, keep_rs_t, state_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
             break;
         case 32:
-            launch_gdn_variant<32, KDA, keep_rs_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
+            launch_gdn_variant<32, KDA, keep_rs_t, state_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
             break;
         case 64:
-            launch_gdn_variant<64, KDA, keep_rs_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
+            launch_gdn_variant<64, KDA, keep_rs_t, state_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
             break;
         case 128: {
             // Dense-prefill regression fix: gate patch 0022's column-fold geometry by per-call scan
@@ -996,7 +1002,7 @@ static void launch_gated_delta_net(
             static const bool gdn_nw_forced  = (getenv("GDN_NW")  != nullptr);
             static const bool gdn_cpw_forced = (getenv("GDN_CPW") != nullptr);
             if (n_tokens >= gdn_prefill_ntok && !gdn_nw_forced && !gdn_cpw_forced) {
-                launch_gdn_variant<128, KDA, keep_rs_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
+                launch_gdn_variant<128, KDA, keep_rs_t, state_t, 4, 1, 2>(GDN_LAUNCH_ARGS);
                 break;
             }
             // Bit-exact occupancy/coalescing retune (patch 0022): fold COLS_PER_WARP columns per warp
@@ -1008,18 +1014,18 @@ static void launch_gated_delta_net(
             // NUM_WARPS in {4,8,16} x COLS_PER_WARP ladder (all <=512 threads/block, no 1024-thread
             // .minnctapersm warnings). Measured GB10 %peak: (4,1)=73 baseline ... (16,4)=82 ...
             // (16,8)=84.7 winner ~ tied with (8,8)/(8,16)/(32,4); the plateau is just above vLLM (82.4).
-            if      (gdn_nw == 4  && gdn_cpw == 1) launch_gdn_variant<128, KDA, keep_rs_t, 4,  1, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 4  && gdn_cpw == 2) launch_gdn_variant<128, KDA, keep_rs_t, 4,  2, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 4  && gdn_cpw == 4) launch_gdn_variant<128, KDA, keep_rs_t, 4,  4, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 8  && gdn_cpw == 1) launch_gdn_variant<128, KDA, keep_rs_t, 8,  1, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 8  && gdn_cpw == 2) launch_gdn_variant<128, KDA, keep_rs_t, 8,  2, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 8  && gdn_cpw == 4) launch_gdn_variant<128, KDA, keep_rs_t, 8,  4, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 8  && gdn_cpw == 8) launch_gdn_variant<128, KDA, keep_rs_t, 8,  8, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 16 && gdn_cpw == 1) launch_gdn_variant<128, KDA, keep_rs_t, 16, 1, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 16 && gdn_cpw == 2) launch_gdn_variant<128, KDA, keep_rs_t, 16, 2, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 16 && gdn_cpw == 4) launch_gdn_variant<128, KDA, keep_rs_t, 16, 4, 2>(GDN_LAUNCH_ARGS);
-            else if (gdn_nw == 16 && gdn_cpw == 8) launch_gdn_variant<128, KDA, keep_rs_t, 16, 8, 2>(GDN_LAUNCH_ARGS);
-            else                                   launch_gdn_variant<128, KDA, keep_rs_t, GDN_DEFAULT_NW, GDN_DEFAULT_CPW, 2>(GDN_LAUNCH_ARGS);
+            if      (gdn_nw == 4  && gdn_cpw == 1) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 4,  1, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 4  && gdn_cpw == 2) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 4,  2, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 4  && gdn_cpw == 4) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 4,  4, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 8  && gdn_cpw == 1) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 8,  1, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 8  && gdn_cpw == 2) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 8,  2, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 8  && gdn_cpw == 4) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 8,  4, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 8  && gdn_cpw == 8) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 8,  8, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 16 && gdn_cpw == 1) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 16, 1, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 16 && gdn_cpw == 2) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 16, 2, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 16 && gdn_cpw == 4) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 16, 4, 2>(GDN_LAUNCH_ARGS);
+            else if (gdn_nw == 16 && gdn_cpw == 8) launch_gdn_variant<128, KDA, keep_rs_t, state_t, 16, 8, 2>(GDN_LAUNCH_ARGS);
+            else                                   launch_gdn_variant<128, KDA, keep_rs_t, state_t, GDN_DEFAULT_NW, GDN_DEFAULT_CPW, 2>(GDN_LAUNCH_ARGS);
             break;
         }
         default:
@@ -1067,13 +1073,14 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     float *       dst_d = (float *) dst->data;
 
-    float * state_dst_d = nullptr;
+    void * state_dst_d = nullptr;
     if (src_state_dst != nullptr) {
         // in-place final-state cache view: per-seq stride must be the dense state size D = S_v*S_v*H
-        GGML_ASSERT(src_state_dst->type == GGML_TYPE_F32);
-        GGML_ASSERT(src_state_dst->nb[0] == sizeof(float));
-        GGML_ASSERT(src_state_dst->nb[1] == (size_t) S_v * S_v * H * sizeof(float));
-        state_dst_d = (float *) src_state_dst->data;
+        GGML_ASSERT(src_state_dst->type == src_state->type);
+        GGML_ASSERT(src_state_dst->type == GGML_TYPE_F32 || src_state_dst->type == GGML_TYPE_BF16);
+        GGML_ASSERT(src_state_dst->nb[0] == ggml_type_size(src_state_dst->type));
+        GGML_ASSERT(src_state_dst->nb[1] == (size_t) S_v * S_v * H * ggml_type_size(src_state_dst->type));
+        state_dst_d = src_state_dst->data;
     }
 
     // Step 2: fused recurrent-state gather (src[7] = ids == s_copy). Read the prior state directly
@@ -1084,19 +1091,28 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
     // the recurrence never reads a slot another block writes, so it is race-free and bit-identical to
     // the get_rows path. ids stays a DEVICE pointer (dereferenced only inside the kernels).
     ggml_tensor * src_ids = dst->src[7];
-    const float *   s_d     = (const float *) src_state->data;
+    const void *    s_d     = src_state->data;
     const int32_t * ids_d   = nullptr;
     int             rs_head = 0;
-    ggml_cuda_pool_alloc<float> ids_state_scratch(ctx.pool());
+    ggml_cuda_pool_alloc<float> ids_state_scratch_f32(ctx.pool());
+    ggml_cuda_pool_alloc<nv_bfloat16> ids_state_scratch_bf16(ctx.pool());
     if (src_ids != nullptr) {
         GGML_ASSERT(state_dst_d != nullptr);
         GGML_ASSERT(src_ids->type == GGML_TYPE_I32);
         rs_head = ggml_get_op_params_i32(dst, 1);
         ids_d   = (const int32_t *) src_ids->data;
         const int64_t D = S_v * S_v * H;
-        float * scratch = ids_state_scratch.alloc((size_t) D * n_seqs);
-        ggml_cuda_gdn_gather_nonident(s_d, ids_d, rs_head, scratch, D, n_seqs, ctx.stream());
-        s_d = scratch;
+        if (src_state->type == GGML_TYPE_F32) {
+            float * scratch = ids_state_scratch_f32.alloc((size_t) D * n_seqs);
+            ggml_cuda_gdn_gather_nonident((const float *) s_d, ids_d, rs_head, scratch, D, n_seqs, ctx.stream());
+            s_d = scratch;
+        } else if (src_state->type == GGML_TYPE_BF16) {
+            nv_bfloat16 * scratch = ids_state_scratch_bf16.alloc((size_t) D * n_seqs);
+            ggml_cuda_gdn_gather_nonident((const nv_bfloat16 *) s_d, ids_d, rs_head, scratch, D, n_seqs, ctx.stream());
+            s_d = scratch;
+        } else {
+            GGML_ABORT("unsupported GDN state type");
+        }
     }
 
     GGML_ASSERT(ggml_is_contiguous_rows(src_q));
@@ -1129,24 +1145,42 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     // in-place write-back is only valid for the single-snapshot (final-state) case
     GGML_ASSERT(state_dst_d == nullptr || !keep_rs);
+    GGML_ASSERT(src_state->type == GGML_TYPE_F32 || (src_state->type == GGML_TYPE_BF16 && state_dst_d != nullptr && !keep_rs));
 
-    if (kda) {
-        if (keep_rs) {
-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_dst_d, ids_d, rs_head,
+    if (src_state->type == GGML_TYPE_BF16) {
+        if (kda) {
+            launch_gated_delta_net<true, false, nv_bfloat16>(q_d, k_d, v_d, g_d, b_d, (const nv_bfloat16 *) s_d,
+                dst_d, (nv_bfloat16 *) state_dst_d, ids_d, rs_head,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
         } else {
-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_dst_d, ids_d, rs_head,
+            launch_gated_delta_net<false, false, nv_bfloat16>(q_d, k_d, v_d, g_d, b_d, (const nv_bfloat16 *) s_d,
+                dst_d, (nv_bfloat16 *) state_dst_d, ids_d, rs_head,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+        }
+        return;
+    }
+
+    const float * s_f32_d = (const float *) s_d;
+    float * state_dst_f32_d = (float *) state_dst_d;
+    if (kda) {
+        if (keep_rs) {
+            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_f32_d, dst_d, state_dst_f32_d, ids_d, rs_head,
+                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+        } else {
+            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_f32_d, dst_d, state_dst_f32_d, ids_d, rs_head,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
         }
     } else {
         if (keep_rs) {
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_dst_d, ids_d, rs_head,
+            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_f32_d, dst_d, state_dst_f32_d, ids_d, rs_head,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
         } else {
-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_dst_d, ids_d, rs_head,
+            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_f32_d, dst_d, state_dst_f32_d, ids_d, rs_head,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
         }

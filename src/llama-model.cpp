@@ -24,6 +24,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -301,6 +302,27 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
 
+}
+
+static ggml_type llama_qwen35_gdn_s_cache_type(llm_arch arch, const llama_cparams & cparams) {
+    if (arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) {
+        return GGML_TYPE_F32;
+    }
+    if (cparams.n_rs_seq > 0) {
+        return GGML_TYPE_F32;
+    }
+
+    const char * env = std::getenv("LLAMA_QWEN35_GDN_S_CACHE_TYPE");
+    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "f32") == 0) {
+        return GGML_TYPE_F32;
+    }
+    if (std::strcmp(env, "bf16") == 0) {
+        LLAMA_LOG_INFO("%s: LLAMA_QWEN35_GDN_S_CACHE_TYPE=bf16, recurrent S cache uses BF16\n", __func__);
+        return GGML_TYPE_BF16;
+    }
+
+    LLAMA_LOG_WARN("%s: unsupported LLAMA_QWEN35_GDN_S_CACHE_TYPE=%s, using f32\n", __func__, env);
+    return GGML_TYPE_F32;
 }
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
@@ -2085,6 +2107,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
+                    const ggml_type recurrent_type_s = llama_qwen35_gdn_s_cache_type(arch, cparams);
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
@@ -2097,7 +2121,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                            /* recurrent_type_s  */ GGML_TYPE_F32,
+                            /* recurrent_type_s  */ recurrent_type_s,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
@@ -2116,7 +2140,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ recurrent_type_s,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,

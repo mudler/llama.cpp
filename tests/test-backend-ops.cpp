@@ -4046,6 +4046,80 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+struct test_gated_delta_net_inplace_ids : public test_case {
+    const ggml_type state_type;
+    const int64_t   head_count;
+    const int64_t   head_size;
+    const int64_t   n_seqs;
+    const bool      kda;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_INPLACE_IDS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(state_type, head_count, head_size, n_seqs, kda);
+    }
+
+    test_gated_delta_net_inplace_ids(
+            ggml_type state_type = GGML_TYPE_BF16,
+            int64_t head_count = 4, int64_t head_size = 64, int64_t n_seqs = 2, bool kda = false)
+        : state_type(state_type), head_count(head_count), head_size(head_size), n_seqs(n_seqs), kda(kda) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_seq_tokens = 1;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+
+        const int64_t g_ne0 = kda ? head_size : 1;
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, g_ne0, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, state_type, head_size, head_size, head_count, n_seqs);
+        ggml_tensor * state_dst = ggml_new_tensor_2d(ctx, state_type, head_size * head_size * head_count, n_seqs);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(state, "state");
+        ggml_set_name(state_dst, "state_dst");
+        ggml_set_name(ids, "ids");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+        ggml_tensor * out = ggml_gated_delta_net_inplace_ids(ctx, q, k, v, g, beta, state, state_dst, ids, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; ++i) {
+                    data[i] = (int32_t) i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -8688,6 +8762,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f));
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {10, 10, 10, 10}, 2.0f, 1.0f, true)); // inplace test
     test_cases.emplace_back(new test_scale(GGML_TYPE_F32, {100, 10, 10, 10}, 2.0f, 1.0f));
+    test_cases.emplace_back(new test_scale(GGML_TYPE_BF16, {10, 10, 10, 10}, 0.0f, 0.0f, true));
     test_cases.emplace_back(new test_softcap(GGML_TYPE_F32, {10, 10, 10, 10}, 50.0f));
     test_cases.emplace_back(new test_silu_back());
 
@@ -9672,6 +9747,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_inplace_ids(GGML_TYPE_BF16, 4, 64, 2));
+    test_cases.emplace_back(new test_gated_delta_net_inplace_ids(GGML_TYPE_BF16, 4, 64, 2, true));
     // Tensor-core chunked-GDN prefill path (S_v==128): multi-chunk (C=16) coverage,
     // incl. a tail chunk (100 = 6*16+4) and multi-seq. Exercised via GDN_CHUNK_MIN + GDN_TC.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1));
