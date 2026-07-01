@@ -14,6 +14,7 @@ struct server_admission_trace_step {
     int32_t waiting_prompt_slots = 0;
     int32_t started_prompt_slots = 0;
     int32_t continued_prompt_slots = 0;
+    int32_t ttft_deferred_decode_slots = 0;
     int32_t prefill_budget_step = 0;
     int32_t prefill_cap_per_slot = 0;
     bool decode_only_step = false;
@@ -27,6 +28,7 @@ struct server_admission_trace_totals {
     int64_t waiting_prompt_slots = 0;
     int64_t started_prompt_slots = 0;
     int64_t continued_prompt_slots = 0;
+    int64_t ttft_deferred_decode_slots = 0;
     int32_t max_waiting_prompt_slots = 0;
     int32_t last_n_batch = 0;
     int32_t last_n_ubatch = 0;
@@ -121,6 +123,7 @@ static inline void server_admission_trace_accumulate(
     totals.waiting_prompt_slots += step.waiting_prompt_slots;
     totals.started_prompt_slots += step.started_prompt_slots;
     totals.continued_prompt_slots += step.continued_prompt_slots;
+    totals.ttft_deferred_decode_slots += step.ttft_deferred_decode_slots;
     totals.max_waiting_prompt_slots = std::max(totals.max_waiting_prompt_slots, step.waiting_prompt_slots);
     totals.last_n_batch = step.n_batch;
     totals.last_n_ubatch = step.n_ubatch;
@@ -142,6 +145,7 @@ static inline std::string server_admission_trace_format(const server_admission_t
         << " max_waiting_prompt_slots=" << totals.max_waiting_prompt_slots
         << " started_prompt_slots=" << totals.started_prompt_slots
         << " continued_prompt_slots=" << totals.continued_prompt_slots
+        << " ttft_deferred_decode_slots=" << totals.ttft_deferred_decode_slots
         << " last_n_batch=" << totals.last_n_batch
         << " last_n_ubatch=" << totals.last_n_ubatch
         << " last_prefill_budget_step=" << totals.last_prefill_budget_step

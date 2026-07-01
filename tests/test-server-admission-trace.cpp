@@ -30,6 +30,7 @@ int main() {
     first.waiting_prompt_slots = 6;
     first.started_prompt_slots = 2;
     first.continued_prompt_slots = 1;
+    first.ttft_deferred_decode_slots = 3;
     first.decode_only_step = false;
     first.prefill_budget_step = 512;
     first.prefill_cap_per_slot = 512;
@@ -59,6 +60,7 @@ int main() {
     require_contains(summary, "max_waiting_prompt_slots=6");
     require_contains(summary, "started_prompt_slots=2");
     require_contains(summary, "continued_prompt_slots=1");
+    require_contains(summary, "ttft_deferred_decode_slots=3");
     require_contains(summary, "last_n_batch=2048");
     require_contains(summary, "last_n_ubatch=512");
     require_contains(summary, "last_prefill_budget_step=0");

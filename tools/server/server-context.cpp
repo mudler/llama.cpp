@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-admission-policy.h"
 #include "server-admission-trace.h"
 #include "server-http.h"
 #include "server-task.h"
@@ -2963,9 +2964,32 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        const bool ttft_prefill_first = []() {
+            const char * e = getenv("LLAMA_TTFT_PREFILL_FIRST");
+            return e ? atoi(e) != 0 : false;
+        }();
+
+        bool ttft_prompt_waiting = false;
+        if (ttft_prefill_first) {
+            iterate(slots, [&](server_slot & slot) {
+                ttft_prompt_waiting = ttft_prompt_waiting ||
+                    slot.state == SLOT_STATE_STARTED ||
+                    slot.state == SLOT_STATE_PROCESSING_PROMPT;
+            });
+        }
+
+        server_admission_trace_step serving_trace_step;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+
+            if (server_admission_should_defer_decode_for_ttft(ttft_prefill_first, ttft_prompt_waiting, slot.n_decoded)) {
+                if (serving_trace_enabled) {
+                    serving_trace_step.ttft_deferred_decode_slots++;
+                }
                 return;
             }
 
@@ -3159,7 +3183,6 @@ private:
             }
         }
         int32_t n_prompt_budgeted = 0; // prompt tokens added to the batch this step (across slots)
-        server_admission_trace_step serving_trace_step;
         if (serving_trace_enabled) {
             serving_trace_step.n_batch = n_batch;
             serving_trace_step.n_ubatch = n_ubatch;
