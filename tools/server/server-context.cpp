@@ -457,12 +457,22 @@ struct server_slot {
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
+        static const bool spec_shape_trace = getenv("LLAMA_SPEC_SHAPE_TRACE") != nullptr;
+        const int32_t batch_before = batch.size();
+
         bool add_ok = true;
         if (spec_draft.empty()) {
             // no speculative decoding
-            i_batch = batch.size();
+            i_batch = batch_before;
 
-            add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
+            const int32_t pos0 = prompt.tokens.pos_next();
+
+            add_ok &= batch.add(id, sampled, pos0, true);
+
+            if (spec_shape_trace) {
+                SLT_INF(*this, "spec shape: kind=decode batch_before=%d rows=1 outputs=1 draft=0 pos0=%d slot_tokens=%zu\n",
+                        batch_before, pos0, prompt.tokens.size());
+            }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
@@ -478,6 +488,12 @@ struct server_slot {
             }
 
             auto pos0 = prompt.tokens.pos_next();
+
+            if (spec_shape_trace) {
+                SLT_INF(*this, "spec shape: kind=verify batch_before=%d rows=%zu outputs=%zu draft=%zu spec_i_first=%d spec_i_last=%d pos0=%d slot_tokens=%zu\n",
+                        batch_before, spec_draft.size() + 1, spec_draft.size() + 1, spec_draft.size(),
+                        spec_i_batch.front(), spec_i_batch.back(), pos0, prompt.tokens.size());
+            }
 
             add_ok &= batch.add(id, sampled, pos0++, true);
             for (auto token : spec_draft) {
