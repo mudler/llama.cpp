@@ -27,6 +27,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fp4-gemm.cuh"
 #include "ggml-cuda/w4a16-gemm.cuh"
+#include "ggml-cuda/w4a16-policy.h"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -2888,70 +2889,86 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
 
-    get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
-        ne10, nb11, nb12, nb13,
-        ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
-        ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
-    CUDA_CHECK(cudaGetLastError());
+    const bool use_w4a16_direct_a = ggml_cuda_w4a16_direct_a_should_engage_params(
+        src0->type, src1->type, dst->type,
+        blackwell_mma_available(cc),
+        ggml_cuda_w4a16_prefill_m(),
+        ggml_cuda_w4a16_direct_a_enabled(),
+        ne12,
+        ne10,
+        ne0);
 
-    // [paged patch 0035] Marlin-style W4A16 grouped MoE prefill GEMM: one launch over the
-    // token-sorted activation buffer (src1_sorted, already f32 + sorted-by-expert above) with a
-    // per-tile expert map, in-register FP4->bf16 weight dequant + bf16 mma. Replaces the
-    // per-expert host-sync GEMM loop. Engages only when LLAMA_W4A16_PREFILL_M>0 and ne12>thr
-    // (large-M prefill); decode / non-NVFP4 keep the loop below (byte-identical to stock).
-    if (ggml_cuda_w4a16_moe_grouped_should_engage(src0, src1, dst, cc)) {
-        ggml_cuda_mul_mat_id_w4a16_grouped(ctx, src0,
-            (const float *) src1_sorted.ptr, (float *) dst_sorted.ptr,
-            tokens_per_expert.data(), ne02, ne10, ne0, stream);
+    if (use_w4a16_direct_a) {
+        ggml_cuda_mul_mat_id_w4a16_grouped_direct_a(ctx, src0,
+            (const float *) src1->data, ids_to_sorted, (float *) dst_sorted.ptr,
+            tokens_per_expert.data(), ne02, n_expert_used, ne10, ne0,
+            nb11, nb12, stream);
     } else {
-    char * src1_data_cur = (char *) src1_sorted.ptr;
-    char *  dst_data_cur = (char *)  dst_sorted.ptr;
-    for (int64_t i02 = 0; i02 < ne02; ++i02) {
-        if (tokens_per_expert[i02] == 0) {
-            continue;
-        }
-
-        ggml_tensor src0_slice = *src0;
-        src0_slice.ne[2]    = 1;
-        src0_slice.nb[3]    = src0_slice.nb[2];
-        src0_slice.op       = GGML_OP_VIEW;
-        src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
-
-        ggml_tensor src1_slice;
-        memset(&src1_slice, 0, sizeof(src1_slice));
-        src1_slice.buffer = src1->buffer;
-        src1_slice.type   = type_src1_sorted;
-        src1_slice.ne[0]  = ne10;
-        src1_slice.ne[1]  = tokens_per_expert[i02];
-        src1_slice.ne[2]  = 1;
-        src1_slice.ne[3]  = 1;
-        src1_slice.nb[0]  = ts_src1_sorted;
-        src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
-        src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
-        src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
-        src1_slice.data   = src1_data_cur;
-
-        ggml_tensor dst_slice;
-        memset(&dst_slice, 0, sizeof(dst_slice));
-        dst_slice.buffer = dst->buffer;
-        dst_slice.type   = type_dst_sorted;
-        dst_slice.ne[0]  = ne0;
-        dst_slice.ne[1]  = tokens_per_expert[i02];
-        dst_slice.ne[2]  = 1;
-        dst_slice.ne[3]  = 1;
-        dst_slice.nb[0]  = ts_dst_sorted;
-        dst_slice.nb[1]  = dst_slice.ne[0] * dst_slice.nb[0];
-        dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
-        dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
-        dst_slice.data   = dst_data_cur;
-
-        ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+        get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
+            ne10, nb11, nb12, nb13,
+            ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
+            ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        src1_data_cur += src1_slice.nb[2];
-        dst_data_cur  +=  dst_slice.nb[2];
-    }
+        // [paged patch 0035] Marlin-style W4A16 grouped MoE prefill GEMM: one launch over the
+        // token-sorted activation buffer (src1_sorted, already f32 + sorted-by-expert above) with a
+        // per-tile expert map, in-register FP4->bf16 weight dequant + bf16 mma. Replaces the
+        // per-expert host-sync GEMM loop. Engages only when LLAMA_W4A16_PREFILL_M>0 and ne12>thr
+        // (large-M prefill); decode / non-NVFP4 keep the loop below (byte-identical to stock).
+        if (ggml_cuda_w4a16_moe_grouped_should_engage(src0, src1, dst, cc)) {
+            ggml_cuda_mul_mat_id_w4a16_grouped(ctx, src0,
+                (const float *) src1_sorted.ptr, (float *) dst_sorted.ptr,
+                tokens_per_expert.data(), ne02, ne10, ne0, stream);
+        } else {
+            char * src1_data_cur = (char *) src1_sorted.ptr;
+            char *  dst_data_cur = (char *)  dst_sorted.ptr;
+            for (int64_t i02 = 0; i02 < ne02; ++i02) {
+                if (tokens_per_expert[i02] == 0) {
+                    continue;
+                }
+
+                ggml_tensor src0_slice = *src0;
+                src0_slice.ne[2]    = 1;
+                src0_slice.nb[3]    = src0_slice.nb[2];
+                src0_slice.op       = GGML_OP_VIEW;
+                src0_slice.view_src = dst->src[0]; // non-const pointer to src0
+                src0_slice.data     = (char *) src0->data + i02*nb02;
+
+                ggml_tensor src1_slice;
+                memset(&src1_slice, 0, sizeof(src1_slice));
+                src1_slice.buffer = src1->buffer;
+                src1_slice.type   = type_src1_sorted;
+                src1_slice.ne[0]  = ne10;
+                src1_slice.ne[1]  = tokens_per_expert[i02];
+                src1_slice.ne[2]  = 1;
+                src1_slice.ne[3]  = 1;
+                src1_slice.nb[0]  = ts_src1_sorted;
+                src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
+                src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
+                src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
+                src1_slice.data   = src1_data_cur;
+
+                ggml_tensor dst_slice;
+                memset(&dst_slice, 0, sizeof(dst_slice));
+                dst_slice.buffer = dst->buffer;
+                dst_slice.type   = type_dst_sorted;
+                dst_slice.ne[0]  = ne0;
+                dst_slice.ne[1]  = tokens_per_expert[i02];
+                dst_slice.ne[2]  = 1;
+                dst_slice.ne[3]  = 1;
+                dst_slice.nb[0]  = ts_dst_sorted;
+                dst_slice.nb[1]  = dst_slice.ne[0] * dst_slice.nb[0];
+                dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
+                dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
+                dst_slice.data   = dst_data_cur;
+
+                ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+                CUDA_CHECK(cudaGetLastError());
+
+                src1_data_cur += src1_slice.nb[2];
+                dst_data_cur  +=  dst_slice.nb[2];
+            }
+        }
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,

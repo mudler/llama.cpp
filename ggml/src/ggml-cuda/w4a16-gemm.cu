@@ -407,3 +407,33 @@ void ggml_cuda_mul_mat_id_w4a16_grouped(
                 ctx, src0, src1_sorted, dst_sorted, tokens_per_expert, n_experts, K, N, stream);
     }
 }
+
+[[noreturn]] void ggml_cuda_mul_mat_id_w4a16_grouped_direct_a(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const float * src1,
+        const int32_t * ids_to_sorted,
+        float * dst_sorted,
+        const int * tokens_per_expert,
+        int64_t n_experts,
+        int64_t n_expert_used,
+        int64_t k,
+        int64_t n,
+        size_t src1_nb1,
+        size_t src1_nb2,
+        cudaStream_t stream) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_UNUSED(ids_to_sorted);
+    GGML_UNUSED(dst_sorted);
+    GGML_UNUSED(tokens_per_expert);
+    GGML_UNUSED(n_experts);
+    GGML_UNUSED(n_expert_used);
+    GGML_UNUSED(k);
+    GGML_UNUSED(n);
+    GGML_UNUSED(src1_nb1);
+    GGML_UNUSED(src1_nb2);
+    GGML_UNUSED(stream);
+    GGML_ABORT("LLAMA_W4A16_DIRECT_A selected before direct-A kernel implementation");
+}

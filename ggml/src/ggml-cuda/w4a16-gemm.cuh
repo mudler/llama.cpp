@@ -54,3 +54,18 @@ void ggml_cuda_mul_mat_id_w4a16_grouped(
         const int * tokens_per_expert,
         int64_t n_experts, int64_t K, int64_t N,
         cudaStream_t stream);
+
+[[noreturn]] void ggml_cuda_mul_mat_id_w4a16_grouped_direct_a(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const float * src1,
+        const int32_t * ids_to_sorted,
+        float * dst_sorted,
+        const int * tokens_per_expert,
+        int64_t n_experts,
+        int64_t n_expert_used,
+        int64_t k,
+        int64_t n,
+        size_t src1_nb1,
+        size_t src1_nb2,
+        cudaStream_t stream);
