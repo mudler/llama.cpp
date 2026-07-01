@@ -2580,6 +2580,32 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static inline int ggml_cuda_mul_mat_route_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_MUL_MAT_ROUTE_TRACE");
+        return s ? atoi(s) : 0;
+    }();
+
+    return value;
+}
+
+static inline void ggml_cuda_mul_mat_route_trace(const ggml_cuda_mul_mat_route_shape & shape) {
+    const int trace_limit = ggml_cuda_mul_mat_route_trace_limit();
+    if (trace_limit <= 0) {
+        return;
+    }
+
+    static std::atomic<int> trace_count{0};
+    const int trace_idx = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (trace_idx >= trace_limit) {
+        return;
+    }
+
+    char buf[256];
+    ggml_cuda_mul_mat_route_shape_format(buf, sizeof(buf), shape);
+    fprintf(stderr, "[LLAMA_MUL_MAT_ROUTE] %s\n", buf);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
@@ -2591,6 +2617,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (!split) {
         const int cc_fp4 = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (ggml_cuda_fp4_prefill_should_engage(src0, src1, dst, cc_fp4)) {
+            ggml_cuda_mul_mat_route_trace(ggml_cuda_mul_mat_route_shape_make(
+                src0->type, dst->ne[1], src1->ne[1], src1->ne[2], src1->ne[3], split,
+                /*use_vec_f=*/false, /*use_mat_f=*/false, /*use_vec_q=*/false, /*use_mmq=*/false,
+                /*use_batched_cublas=*/false, /*use_fp4_prefill=*/true, /*use_fwht=*/false));
             ggml_cuda_mul_mat_fp4_large_m(ctx, src0, src1, dst);
             return;
         }
@@ -2654,11 +2684,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f16  = src0->type == GGML_TYPE_F16 && (src1->type == GGML_TYPE_F16 || !any_gpus_with_slow_fp16);
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
+    bool use_batched_cublas      = !split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
+        && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1;
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !split && ggml_cuda_op_fwht(ctx, src1, dst)) {
+        ggml_cuda_mul_mat_route_trace(ggml_cuda_mul_mat_route_shape_make(
+            src0->type, dst->ne[1], src1->ne[1], src1->ne[2], src1->ne[3], split,
+            use_mul_mat_vec_f, use_mul_mat_f, use_mul_mat_vec_q, use_mul_mat_q,
+            use_batched_cublas, /*use_fp4_prefill=*/false, /*use_fwht=*/true));
         return;
     }
+
+    ggml_cuda_mul_mat_route_trace(ggml_cuda_mul_mat_route_shape_make(
+        src0->type, dst->ne[1], src1->ne[1], src1->ne[2], src1->ne[3], split,
+        use_mul_mat_vec_f, use_mul_mat_f, use_mul_mat_vec_q, use_mul_mat_q,
+        use_batched_cublas, /*use_fp4_prefill=*/false, /*use_fwht=*/false));
 
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
@@ -2670,8 +2711,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
     } else if (!split && use_mul_mat_q) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
-    } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
-        && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
+    } else if (use_batched_cublas) {
         // general KQ + KQV multi-batch without FlashAttention
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
     } else if (use_mul_mat_vec_f) {

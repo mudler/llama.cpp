@@ -71,6 +71,37 @@ struct ggml_cuda_mmid_route_shape {
     bool host_sync;
 };
 
+enum ggml_cuda_mul_mat_route {
+    GGML_CUDA_MUL_MAT_ROUTE_FP4_PREFILL,
+    GGML_CUDA_MUL_MAT_ROUTE_FWHT,
+    GGML_CUDA_MUL_MAT_ROUTE_VEC_F,
+    GGML_CUDA_MUL_MAT_ROUTE_MAT_F,
+    GGML_CUDA_MUL_MAT_ROUTE_VEC_Q,
+    GGML_CUDA_MUL_MAT_ROUTE_MMQ,
+    GGML_CUDA_MUL_MAT_ROUTE_BATCHED_CUBLAS,
+    GGML_CUDA_MUL_MAT_ROUTE_OP_VEC_F,
+    GGML_CUDA_MUL_MAT_ROUTE_OP_VEC_Q,
+    GGML_CUDA_MUL_MAT_ROUTE_OP_MMQ,
+    GGML_CUDA_MUL_MAT_ROUTE_OP_CUBLAS,
+};
+
+struct ggml_cuda_mul_mat_route_shape {
+    ggml_cuda_mul_mat_route route;
+    int type;
+    int64_t ne1;
+    int64_t ne11;
+    int64_t ne12;
+    int64_t ne13;
+    bool split;
+    bool use_vec_f;
+    bool use_mat_f;
+    bool use_vec_q;
+    bool use_mmq;
+    bool use_batched_cublas;
+    bool use_fp4_prefill;
+    bool use_fwht;
+};
+
 static inline const char * ggml_cuda_mmid_route_name(const ggml_cuda_mmid_route route) {
     switch (route) {
         case GGML_CUDA_MMID_ROUTE_MMVQ:     return "mmvq";
@@ -78,6 +109,24 @@ static inline const char * ggml_cuda_mmid_route_name(const ggml_cuda_mmid_route 
         case GGML_CUDA_MMID_ROUTE_MMQ:      return "mmq";
         case GGML_CUDA_MMID_ROUTE_MMF:      return "mmf";
         case GGML_CUDA_MMID_ROUTE_FALLBACK: return "fallback";
+    }
+
+    return "unknown";
+}
+
+static inline const char * ggml_cuda_mul_mat_route_name(const ggml_cuda_mul_mat_route route) {
+    switch (route) {
+        case GGML_CUDA_MUL_MAT_ROUTE_FP4_PREFILL:    return "fp4_prefill";
+        case GGML_CUDA_MUL_MAT_ROUTE_FWHT:           return "fwht";
+        case GGML_CUDA_MUL_MAT_ROUTE_VEC_F:          return "vec_f";
+        case GGML_CUDA_MUL_MAT_ROUTE_MAT_F:          return "mat_f";
+        case GGML_CUDA_MUL_MAT_ROUTE_VEC_Q:          return "vec_q";
+        case GGML_CUDA_MUL_MAT_ROUTE_MMQ:            return "mmq";
+        case GGML_CUDA_MUL_MAT_ROUTE_BATCHED_CUBLAS: return "batched_cublas";
+        case GGML_CUDA_MUL_MAT_ROUTE_OP_VEC_F:       return "op_vec_f";
+        case GGML_CUDA_MUL_MAT_ROUTE_OP_VEC_Q:       return "op_vec_q";
+        case GGML_CUDA_MUL_MAT_ROUTE_OP_MMQ:         return "op_mmq";
+        case GGML_CUDA_MUL_MAT_ROUTE_OP_CUBLAS:      return "op_cublas";
     }
 
     return "unknown";
@@ -107,6 +156,52 @@ static inline ggml_cuda_mmq_shape ggml_cuda_mmq_shape_make(
         mmq_x_best,
         mmq_y,
         use_stream_k,
+    };
+}
+
+static inline ggml_cuda_mul_mat_route_shape ggml_cuda_mul_mat_route_shape_make(
+        const int type, const int64_t ne1, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+        const bool split, const bool use_vec_f, const bool use_mat_f, const bool use_vec_q,
+        const bool use_mmq, const bool use_batched_cublas, const bool use_fp4_prefill,
+        const bool use_fwht) {
+    ggml_cuda_mul_mat_route route = GGML_CUDA_MUL_MAT_ROUTE_OP_CUBLAS;
+    if (use_fp4_prefill) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_FP4_PREFILL;
+    } else if (use_fwht) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_FWHT;
+    } else if (!split && use_vec_f) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_VEC_F;
+    } else if (!split && use_mat_f) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_MAT_F;
+    } else if (!split && use_vec_q) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_VEC_Q;
+    } else if (!split && use_mmq) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_MMQ;
+    } else if (!split && use_batched_cublas) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_BATCHED_CUBLAS;
+    } else if (use_vec_f) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_OP_VEC_F;
+    } else if (use_vec_q) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_OP_VEC_Q;
+    } else if (use_mmq) {
+        route = GGML_CUDA_MUL_MAT_ROUTE_OP_MMQ;
+    }
+
+    return {
+        route,
+        type,
+        ne1,
+        ne11,
+        ne12,
+        ne13,
+        split,
+        use_vec_f,
+        use_mat_f,
+        use_vec_q,
+        use_mmq,
+        use_batched_cublas,
+        use_fp4_prefill,
+        use_fwht,
     };
 }
 
@@ -258,6 +353,28 @@ static inline int ggml_cuda_mmid_route_shape_format(
         shape.use_mmf ? 1 : 0,
         shape.is_amd ? 1 : 0,
         shape.is_quantized ? 1 : 0);
+}
+
+static inline int ggml_cuda_mul_mat_route_shape_format(
+        char * buf, const size_t size, const ggml_cuda_mul_mat_route_shape & shape) {
+    return std::snprintf(buf, size,
+        "route=%s type=%d ne1=%lld ne11=%lld ne12=%lld ne13=%lld split=%d "
+        "use_vec_f=%d use_mat_f=%d use_vec_q=%d use_mmq=%d use_batched_cublas=%d "
+        "use_fp4_prefill=%d use_fwht=%d",
+        ggml_cuda_mul_mat_route_name(shape.route),
+        shape.type,
+        (long long) shape.ne1,
+        (long long) shape.ne11,
+        (long long) shape.ne12,
+        (long long) shape.ne13,
+        shape.split ? 1 : 0,
+        shape.use_vec_f ? 1 : 0,
+        shape.use_mat_f ? 1 : 0,
+        shape.use_vec_q ? 1 : 0,
+        shape.use_mmq ? 1 : 0,
+        shape.use_batched_cublas ? 1 : 0,
+        shape.use_fp4_prefill ? 1 : 0,
+        shape.use_fwht ? 1 : 0);
 }
 
 static inline int ggml_cuda_mmq_small_m_shape_format(
