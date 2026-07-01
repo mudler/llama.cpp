@@ -63,6 +63,9 @@ int main() {
     require_contains(summary, "last_n_ubatch=512");
     require_contains(summary, "last_prefill_budget_step=0");
     require_contains(summary, "last_prefill_cap_per_slot=0");
+    require_contains(summary, "prompt_hist=0:1,257-512:1");
+    require_contains(summary, "decode_hist=128-255:2");
+    require_contains(summary, "waiting_hist=1-7:2");
 
     return 0;
 }

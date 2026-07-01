@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <sstream>
 #include <string>
@@ -31,7 +32,84 @@ struct server_admission_trace_totals {
     int32_t last_n_ubatch = 0;
     int32_t last_prefill_budget_step = 0;
     int32_t last_prefill_cap_per_slot = 0;
+    std::array<int64_t, 6> prompt_hist = {};
+    std::array<int64_t, 6> decode_hist = {};
+    std::array<int64_t, 6> waiting_hist = {};
 };
+
+static inline int server_admission_trace_prompt_bucket(const int32_t n) {
+    if (n <= 0) {
+        return 0;
+    }
+    if (n <= 64) {
+        return 1;
+    }
+    if (n <= 128) {
+        return 2;
+    }
+    if (n <= 256) {
+        return 3;
+    }
+    if (n <= 512) {
+        return 4;
+    }
+    return 5;
+}
+
+static inline int server_admission_trace_decode_bucket(const int32_t n) {
+    if (n <= 0) {
+        return 0;
+    }
+    if (n <= 63) {
+        return 1;
+    }
+    if (n <= 127) {
+        return 2;
+    }
+    if (n <= 255) {
+        return 3;
+    }
+    if (n <= 511) {
+        return 4;
+    }
+    return 5;
+}
+
+static inline int server_admission_trace_waiting_bucket(const int32_t n) {
+    if (n <= 0) {
+        return 0;
+    }
+    if (n <= 7) {
+        return 1;
+    }
+    if (n <= 15) {
+        return 2;
+    }
+    if (n <= 31) {
+        return 3;
+    }
+    if (n <= 63) {
+        return 4;
+    }
+    return 5;
+}
+
+static inline void server_admission_trace_format_hist(
+        std::ostringstream & out,
+        const std::array<int64_t, 6> & hist,
+        const char * const labels[6]) {
+    bool first = true;
+    for (int i = 0; i < 6; ++i) {
+        if (hist[i] == 0) {
+            continue;
+        }
+        if (!first) {
+            out << ",";
+        }
+        out << labels[i] << ":" << hist[i];
+        first = false;
+    }
+}
 
 static inline void server_admission_trace_accumulate(
         server_admission_trace_totals & totals,
@@ -48,6 +126,9 @@ static inline void server_admission_trace_accumulate(
     totals.last_n_ubatch = step.n_ubatch;
     totals.last_prefill_budget_step = step.prefill_budget_step;
     totals.last_prefill_cap_per_slot = step.prefill_cap_per_slot;
+    totals.prompt_hist[server_admission_trace_prompt_bucket(step.prompt_tokens)]++;
+    totals.decode_hist[server_admission_trace_decode_bucket(step.decode_tokens)]++;
+    totals.waiting_hist[server_admission_trace_waiting_bucket(step.waiting_prompt_slots)]++;
 }
 
 static inline std::string server_admission_trace_format(const server_admission_trace_totals & totals) {
@@ -65,5 +146,14 @@ static inline std::string server_admission_trace_format(const server_admission_t
         << " last_n_ubatch=" << totals.last_n_ubatch
         << " last_prefill_budget_step=" << totals.last_prefill_budget_step
         << " last_prefill_cap_per_slot=" << totals.last_prefill_cap_per_slot;
+    static const char * const prompt_labels[6] = {"0", "1-64", "65-128", "129-256", "257-512", "513+"};
+    static const char * const decode_labels[6] = {"0", "1-63", "64-127", "128-255", "256-511", "512+"};
+    static const char * const waiting_labels[6] = {"0", "1-7", "8-15", "16-31", "32-63", "64+"};
+    out << " prompt_hist=";
+    server_admission_trace_format_hist(out, totals.prompt_hist, prompt_labels);
+    out << " decode_hist=";
+    server_admission_trace_format_hist(out, totals.decode_hist, decode_labels);
+    out << " waiting_hist=";
+    server_admission_trace_format_hist(out, totals.waiting_hist, waiting_labels);
     return out.str();
 }
