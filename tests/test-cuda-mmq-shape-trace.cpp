@@ -108,5 +108,15 @@ int main() {
     require(std::strstr(buf, "density=4") != nullptr, "small-M trace includes density");
     require(std::strstr(buf, "mmq_x_best=64") != nullptr, "small-M trace includes selected tile");
 
+    require(ggml_cuda_mmq_small_m_tile_limit(small_m, 64, 0) == 64,
+        "small-M tile override is default-off");
+    require(ggml_cuda_mmq_small_m_tile_limit(small_m, 64, 16) == 16,
+        "small-M tile override caps candidate tile limit");
+    require(ggml_cuda_mmq_small_m_tile_limit(small_m, 64, 128) == 64,
+        "small-M tile override ignores non-smaller tiles");
+    require(ggml_cuda_mmq_small_m_tile_limit(
+        ggml_cuda_mmq_small_m_shape_make(/* is_moe */ true, 4096, 256, 512, 128, true), 128, 16) == 128,
+        "small-M tile override excludes prefill-like shapes");
+
     return 0;
 }

@@ -4201,6 +4201,15 @@ static inline int ggml_cuda_moe_density_max() {
     return d;
 }
 
+static inline int ggml_cuda_moe_small_m_tile() {
+    static const int t = []() -> int {
+        const char * s = getenv("LLAMA_MOE_SMALL_M_TILE");
+        const int v = s ? atoi(s) : 0;
+        return v >= 8 ? v : 0;
+    }();
+    return t;
+}
+
 // [paged patch 0017 / track B] DENSE NVFP4 decode mmq_x re-read occupancy DIAGNOSTIC (env, default off).
 // GGML_CUDA_FP4_DENSE_MMQ_X=<n> caps the dense (non-MoE) NVFP4 col-tile to <n>, splitting the M=128
 // decode ubatch into ceil(128/n) col-tiles. Each col-tile re-reads the full weight set (fatal cost
@@ -4282,6 +4291,10 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
                 }
             }
         }
+
+        const ggml_cuda_mmq_small_m_shape small_m = ggml_cuda_mmq_small_m_shape_make(
+            true, args.ncols_dst, args.nchannels_x, args.ncols_max, mmq_x_lim, args.use_stream_k);
+        mmq_x_lim = ggml_cuda_mmq_small_m_tile_limit(small_m, mmq_x_lim, ggml_cuda_moe_small_m_tile());
     }
 
     int mmq_x_best  = 0;

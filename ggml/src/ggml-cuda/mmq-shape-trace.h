@@ -187,3 +187,12 @@ static inline int ggml_cuda_mmq_small_m_shape_format(
         shape.mmq_x_best,
         shape.use_stream_k ? 1 : 0);
 }
+
+static inline int ggml_cuda_mmq_small_m_tile_limit(
+        const ggml_cuda_mmq_small_m_shape & shape, const int current_limit, const int requested_tile) {
+    if (!shape.is_candidate || requested_tile < 8 || requested_tile >= current_limit) {
+        return current_limit;
+    }
+
+    return requested_tile;
+}
