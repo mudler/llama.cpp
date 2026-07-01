@@ -952,6 +952,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
+        if (this->params.backend_sampling) {
+            LOG_WRN("%s: backend draft sampling is disabled for MTP; verification batches can request multiple output rows per sequence\n",
+                    __func__);
+            this->params.backend_sampling = false;
+        }
+
         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
         batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
