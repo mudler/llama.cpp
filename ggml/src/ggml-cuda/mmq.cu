@@ -1,8 +1,51 @@
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+
+static inline int ggml_cuda_quant_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_QUANT_TRACE");
+        return s ? atoi(s) : 0;
+    }();
+
+    return value;
+}
+
+static inline const char * ggml_cuda_quant_trace_tensor_name(const ggml_tensor * t) {
+    return t != nullptr && t->name[0] != '\0' ? t->name : "-";
+}
+
+static inline void ggml_cuda_quant_trace(
+        const char * route, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, const ggml_tensor * dst, const int native_fp4,
+        const int dedup, const int gathered, const int64_t ne10, const int64_t ne10_padded,
+        const int64_t rows, const int64_t ne12, const int64_t n_expert_used) {
+    const int trace_limit = ggml_cuda_quant_trace_limit();
+    if (trace_limit <= 0) {
+        return;
+    }
+
+    static std::atomic<int> trace_count{0};
+    const int trace_idx = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (trace_idx >= trace_limit) {
+        return;
+    }
+
+    fprintf(stderr,
+        "[LLAMA_QUANT_TRACE] route=%s src0=%s src0_type=%s src1=%s src1_type=%s dst=%s dst_type=%s ids=%s "
+        "native_fp4=%d dedup=%d gathered=%d K=%" PRId64 " Kpad=%" PRId64 " rows=%" PRId64
+        " ne12=%" PRId64 " experts=%" PRId64 "\n",
+        route, ggml_cuda_quant_trace_tensor_name(src0), src0 != nullptr ? ggml_type_name(src0->type) : "-",
+        ggml_cuda_quant_trace_tensor_name(src1), src1 != nullptr ? ggml_type_name(src1->type) : "-",
+        ggml_cuda_quant_trace_tensor_name(dst), dst != nullptr ? ggml_type_name(dst->type) : "-",
+        ggml_cuda_quant_trace_tensor_name(ids), native_fp4, dedup, gathered,
+        ne10, ne10_padded, rows, ne12, n_expert_used);
+}
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -134,6 +177,8 @@ void ggml_cuda_mul_mat_q(
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
+            ggml_cuda_quant_trace("mmq_dense", src0, src1, ids, dst, use_native_fp4 ? 1 : 0,
+                0, 0, ne10, ne10_padded, ne11, ne12, 0);
             if (use_native_fp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
@@ -208,15 +253,23 @@ void ggml_cuda_mul_mat_q(
                 const size_t nbytes_unique = ne12*ne10_padded * sizeof(block_q8_1)/QK8_1 +
                     get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
                 ggml_cuda_pool_alloc<char> src1_unique(ctx.pool(), nbytes_unique);
+                ggml_cuda_quant_trace("mmq_moe_dedup_unique", src0, src1, ids, dst, use_native_fp4 ? 1 : 0,
+                    1, 0, ne10, ne10_padded, ne12, ne12, n_expert_used);
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_unique.get(), src0->type, ne10, s12, 0, 0,
                                         ne10_padded, ne12, 1, 1, stream);
+                ggml_cuda_quant_trace("mmq_moe_gather", src0, src1, ids, dst, use_native_fp4 ? 1 : 0,
+                    1, 1, ne10, ne10_padded, ne11_flat, ne12, n_expert_used);
                 gather_mmq_fp4_cuda(src1_unique.get(), ids_src1.get(), src1_q8_1.get(),
                                     ne11_flat, ne12, ne10_padded, stream);
             } else {
+                ggml_cuda_quant_trace("mmq_moe_flat", src0, src1, ids, dst, use_native_fp4 ? 1 : 0,
+                    0, 0, ne10, ne10_padded, ne11_flat, ne12, n_expert_used);
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else {
+            ggml_cuda_quant_trace("mmq_moe_flat", src0, src1, ids, dst, use_native_fp4 ? 1 : 0,
+                0, 0, ne10, ne10_padded, ne11_flat, ne12, n_expert_used);
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }

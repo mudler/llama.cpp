@@ -1,6 +1,9 @@
 #include "fp4-gemm.cuh"
 
+#include <atomic>
 #include <cfloat>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 
@@ -25,6 +28,42 @@ static int64_t ggml_cuda_fp4_prefill_m() {
         return e != nullptr ? (int64_t) atoll(e) : (int64_t) LLAMA_FP4_PREFILL_M;
     }();
     return m;
+}
+
+static inline int ggml_cuda_fp4_quant_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_QUANT_TRACE");
+        return s ? atoi(s) : 0;
+    }();
+
+    return value;
+}
+
+static inline const char * ggml_cuda_fp4_quant_trace_tensor_name(const ggml_tensor * t) {
+    return t != nullptr && t->name[0] != '\0' ? t->name : "-";
+}
+
+static inline void ggml_cuda_fp4_quant_trace(
+        const char * route, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        const int64_t K, const int64_t M, const int64_t Mpad, const int64_t Kb) {
+    const int trace_limit = ggml_cuda_fp4_quant_trace_limit();
+    if (trace_limit <= 0) {
+        return;
+    }
+
+    static std::atomic<int> trace_count{0};
+    const int trace_idx = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (trace_idx >= trace_limit) {
+        return;
+    }
+
+    fprintf(stderr,
+        "[LLAMA_QUANT_TRACE] route=%s src0=%s src0_type=%s src1=%s src1_type=%s dst=%s dst_type=%s "
+        "K=%" PRId64 " M=%" PRId64 " Mpad=%" PRId64 " Kb=%" PRId64 "\n",
+        route, ggml_cuda_fp4_quant_trace_tensor_name(src0), src0 != nullptr ? ggml_type_name(src0->type) : "-",
+        ggml_cuda_fp4_quant_trace_tensor_name(src1), src1 != nullptr ? ggml_type_name(src1->type) : "-",
+        ggml_cuda_fp4_quant_trace_tensor_name(dst), dst != nullptr ? ggml_type_name(dst->type) : "-",
+        K, M, Mpad, Kb);
 }
 
 // ---- layout split: block_nvfp4[R*Kb] -> qs codes [R*Kb*8 u32] + scales [R*Kb u32] ----
@@ -420,6 +459,7 @@ void ggml_cuda_mul_mat_fp4_large_m(
         const int64_t tot     = M * Kb * 4;
         const int     threads = 256;
         const int64_t grid    = (tot + threads - 1) / threads;
+        ggml_cuda_fp4_quant_trace("fp4_prefill_act_split", src0, src1, dst, K, M, Mpad, Kb);
         fp4_quantize_act_split<<<grid, threads, 0, stream>>>(
             (const float *) src1->data, Aq.get(), As.get(), (int) M, (int) K, (int) Kb);
         CUDA_CHECK(cudaGetLastError());
