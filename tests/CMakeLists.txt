@@ -170,6 +170,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-gbnf-validator.cpp)
 
+    llama_build(test-cuda-w4a16-policy.cpp)
+    target_include_directories(test-cuda-w4a16-policy PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    llama_test(test-cuda-w4a16-policy)
+
     # build test-tokenizer-1-bpe target once and add many tests
     llama_build(test-tokenizer-1-bpe.cpp)
 

@@ -37,6 +37,7 @@ bool ggml_cuda_w4a16_moe_grouped_should_engage(
 // True iff LLAMA_W4A16_PREFILL_M > 0 (the master on/off for the mmq.cu grouped-MMQ-off gate).
 bool ggml_cuda_w4a16_prefill_enabled();
 int64_t ggml_cuda_w4a16_prefill_m();
+bool ggml_cuda_w4a16_direct_a_enabled();
 
 // Grouped W4A16 MoE GEMM over the token-sorted buffer.
 //   src0          : NVFP4 weights [K, N, n_experts] (one [K,N] matrix per expert)

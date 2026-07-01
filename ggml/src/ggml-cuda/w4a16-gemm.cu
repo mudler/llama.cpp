@@ -1,4 +1,5 @@
 #include "w4a16-gemm.cuh"
+#include "w4a16-policy.h"
 #include "mma.cuh"
 
 #include <algorithm>
@@ -41,6 +42,14 @@ int64_t ggml_cuda_w4a16_prefill_m() {
 
 bool ggml_cuda_w4a16_prefill_enabled() {
     return ggml_cuda_w4a16_prefill_m() > 0;
+}
+
+bool ggml_cuda_w4a16_direct_a_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_W4A16_DIRECT_A");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
 }
 
 // ---- cp.async helpers (sm80+; raw bytes, no cast) ----
