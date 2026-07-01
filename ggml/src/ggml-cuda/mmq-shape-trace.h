@@ -85,6 +85,14 @@ enum ggml_cuda_mul_mat_route {
     GGML_CUDA_MUL_MAT_ROUTE_OP_CUBLAS,
 };
 
+enum ggml_cuda_cublas_route {
+    GGML_CUDA_CUBLAS_ROUTE_NVFP4_BF16_TC,
+    GGML_CUDA_CUBLAS_ROUTE_BF16_TC,
+    GGML_CUDA_CUBLAS_ROUTE_F16_TC_32F,
+    GGML_CUDA_CUBLAS_ROUTE_F16_TC_16F,
+    GGML_CUDA_CUBLAS_ROUTE_SGEMM,
+};
+
 struct ggml_cuda_mul_mat_route_shape {
     ggml_cuda_mul_mat_route route;
     int type;
@@ -100,6 +108,27 @@ struct ggml_cuda_mul_mat_route_shape {
     bool use_batched_cublas;
     bool use_fp4_prefill;
     bool use_fwht;
+};
+
+struct ggml_cuda_cublas_route_shape {
+    ggml_cuda_cublas_route route;
+    int type;
+    int src1_type;
+    int64_t row_diff;
+    int64_t src1_ncols;
+    int64_t ne00;
+    int64_t ne10;
+    int64_t ldc;
+    bool supports_bf16;
+    bool use_fp16;
+    bool fast_fp16;
+    bool force_fp32;
+    bool force_fp16;
+    bool src0_contig;
+    bool full_rows;
+    bool is_cdna;
+    bool is_rdna4;
+    bool is_volta;
 };
 
 static inline const char * ggml_cuda_mmid_route_name(const ggml_cuda_mmid_route route) {
@@ -127,6 +156,18 @@ static inline const char * ggml_cuda_mul_mat_route_name(const ggml_cuda_mul_mat_
         case GGML_CUDA_MUL_MAT_ROUTE_OP_VEC_Q:       return "op_vec_q";
         case GGML_CUDA_MUL_MAT_ROUTE_OP_MMQ:         return "op_mmq";
         case GGML_CUDA_MUL_MAT_ROUTE_OP_CUBLAS:      return "op_cublas";
+    }
+
+    return "unknown";
+}
+
+static inline const char * ggml_cuda_cublas_route_name(const ggml_cuda_cublas_route route) {
+    switch (route) {
+        case GGML_CUDA_CUBLAS_ROUTE_NVFP4_BF16_TC: return "nvfp4_bf16_tc";
+        case GGML_CUDA_CUBLAS_ROUTE_BF16_TC:       return "bf16_tc";
+        case GGML_CUDA_CUBLAS_ROUTE_F16_TC_32F:    return "f16_tc_32f";
+        case GGML_CUDA_CUBLAS_ROUTE_F16_TC_16F:    return "f16_tc_16f";
+        case GGML_CUDA_CUBLAS_ROUTE_SGEMM:         return "sgemm";
     }
 
     return "unknown";
@@ -202,6 +243,47 @@ static inline ggml_cuda_mul_mat_route_shape ggml_cuda_mul_mat_route_shape_make(
         use_batched_cublas,
         use_fp4_prefill,
         use_fwht,
+    };
+}
+
+static inline ggml_cuda_cublas_route_shape ggml_cuda_cublas_route_shape_make(
+        const int type, const int src1_type, const int64_t row_diff, const int64_t src1_ncols,
+        const int64_t ne00, const int64_t ne10, const int64_t ldc, const bool supports_bf16,
+        const bool use_fp16, const bool fast_fp16, const bool force_fp32, const bool force_fp16,
+        const bool src0_contig, const bool full_rows, const bool is_cdna, const bool is_rdna4,
+        const bool is_volta) {
+    ggml_cuda_cublas_route route = GGML_CUDA_CUBLAS_ROUTE_SGEMM;
+    if (supports_bf16 && type == 40 && src0_contig && full_rows) {
+        route = GGML_CUDA_CUBLAS_ROUTE_NVFP4_BF16_TC;
+    } else if (supports_bf16 && type == 30 && src0_contig && full_rows) {
+        route = GGML_CUDA_CUBLAS_ROUTE_BF16_TC;
+    } else if (fast_fp16 && use_fp16) {
+        if (!force_fp16 && (is_cdna || is_rdna4 || is_volta || force_fp32)) {
+            route = GGML_CUDA_CUBLAS_ROUTE_F16_TC_32F;
+        } else {
+            route = GGML_CUDA_CUBLAS_ROUTE_F16_TC_16F;
+        }
+    }
+
+    return {
+        route,
+        type,
+        src1_type,
+        row_diff,
+        src1_ncols,
+        ne00,
+        ne10,
+        ldc,
+        supports_bf16,
+        use_fp16,
+        fast_fp16,
+        force_fp32,
+        force_fp16,
+        src0_contig,
+        full_rows,
+        is_cdna,
+        is_rdna4,
+        is_volta,
     };
 }
 
@@ -375,6 +457,32 @@ static inline int ggml_cuda_mul_mat_route_shape_format(
         shape.use_batched_cublas ? 1 : 0,
         shape.use_fp4_prefill ? 1 : 0,
         shape.use_fwht ? 1 : 0);
+}
+
+static inline int ggml_cuda_cublas_route_shape_format(
+        char * buf, const size_t size, const ggml_cuda_cublas_route_shape & shape) {
+    return std::snprintf(buf, size,
+        "route=%s type=%d src1_type=%d row_diff=%lld src1_ncols=%lld ne00=%lld ne10=%lld ldc=%lld "
+        "supports_bf16=%d use_fp16=%d fast_fp16=%d force_fp32=%d force_fp16=%d "
+        "src0_contig=%d full_rows=%d is_cdna=%d is_rdna4=%d is_volta=%d",
+        ggml_cuda_cublas_route_name(shape.route),
+        shape.type,
+        shape.src1_type,
+        (long long) shape.row_diff,
+        (long long) shape.src1_ncols,
+        (long long) shape.ne00,
+        (long long) shape.ne10,
+        (long long) shape.ldc,
+        shape.supports_bf16 ? 1 : 0,
+        shape.use_fp16 ? 1 : 0,
+        shape.fast_fp16 ? 1 : 0,
+        shape.force_fp32 ? 1 : 0,
+        shape.force_fp16 ? 1 : 0,
+        shape.src0_contig ? 1 : 0,
+        shape.full_rows ? 1 : 0,
+        shape.is_cdna ? 1 : 0,
+        shape.is_rdna4 ? 1 : 0,
+        shape.is_volta ? 1 : 0);
 }
 
 static inline int ggml_cuda_mmq_small_m_shape_format(

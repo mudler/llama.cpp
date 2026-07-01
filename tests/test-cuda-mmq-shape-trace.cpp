@@ -285,5 +285,67 @@ int main() {
     require(std::strstr(buf, "use_batched_cublas=0") != nullptr,
         "regular MUL_MAT trace includes batched cuBLAS predicate");
 
+    const ggml_cuda_cublas_route_shape bf16_tc = ggml_cuda_cublas_route_shape_make(
+        /* type */ 30,
+        /* src1_type */ 0,
+        /* row_diff */ 18,
+        /* src1_ncols */ 18,
+        /* ne00 */ 1024,
+        /* ne10 */ 1024,
+        /* ldc */ 18,
+        /* supports_bf16 */ true,
+        /* use_fp16 */ false,
+        /* fast_fp16 */ true,
+        /* force_fp32 */ false,
+        /* force_fp16 */ false,
+        /* src0_contig */ true,
+        /* full_rows */ true,
+        /* is_cdna */ false,
+        /* is_rdna4 */ false,
+        /* is_volta */ false);
+
+    require(bf16_tc.route == GGML_CUDA_CUBLAS_ROUTE_BF16_TC,
+        "cuBLAS records native BF16 tensor-core route");
+
+    const ggml_cuda_cublas_route_shape nvfp4_bf16_tc = ggml_cuda_cublas_route_shape_make(
+        /* type */ 40, 0, 128, 128, 1024, 1024, 128, true, false, true, false, false, true, true,
+        false, false, false);
+
+    require(nvfp4_bf16_tc.route == GGML_CUDA_CUBLAS_ROUTE_NVFP4_BF16_TC,
+        "cuBLAS records NVFP4 dequant-to-BF16 tensor-core route");
+
+    const ggml_cuda_cublas_route_shape f16_tc_16f = ggml_cuda_cublas_route_shape_make(
+        /* type */ 1, 0, 64, 64, 1024, 1024, 64, false, true, true, false, false, true, true,
+        false, false, false);
+
+    require(f16_tc_16f.route == GGML_CUDA_CUBLAS_ROUTE_F16_TC_16F,
+        "cuBLAS records default FP16 tensor-core 16F compute route");
+
+    const ggml_cuda_cublas_route_shape f16_tc_32f = ggml_cuda_cublas_route_shape_make(
+        /* type */ 1, 0, 64, 64, 1024, 1024, 64, false, true, true, true, false, true, true,
+        false, false, false);
+
+    require(f16_tc_32f.route == GGML_CUDA_CUBLAS_ROUTE_F16_TC_32F,
+        "cuBLAS records forced FP16 tensor-core 32F compute route");
+
+    const ggml_cuda_cublas_route_shape sgemm = ggml_cuda_cublas_route_shape_make(
+        /* type */ 0, 0, 12, 12, 1024, 1024, 12, false, false, true, false, false, true, true,
+        false, false, false);
+
+    require(sgemm.route == GGML_CUDA_CUBLAS_ROUTE_SGEMM,
+        "cuBLAS records SGEMM fallback route");
+
+    const int cublas_route_n = ggml_cuda_cublas_route_shape_format(buf, sizeof(buf), bf16_tc);
+
+    require(cublas_route_n > 0, "cuBLAS route format returns byte count");
+    require(std::strstr(buf, "route=bf16_tc") != nullptr, "cuBLAS trace includes route name");
+    require(std::strstr(buf, "type=30") != nullptr, "cuBLAS trace includes src0 type");
+    require(std::strstr(buf, "src1_type=0") != nullptr, "cuBLAS trace includes src1 type");
+    require(std::strstr(buf, "row_diff=18") != nullptr, "cuBLAS trace includes row count");
+    require(std::strstr(buf, "src1_ncols=18") != nullptr, "cuBLAS trace includes source column count");
+    require(std::strstr(buf, "supports_bf16=1") != nullptr, "cuBLAS trace includes BF16 predicate");
+    require(std::strstr(buf, "force_fp32=0") != nullptr, "cuBLAS trace includes forced compute predicate");
+    require(std::strstr(buf, "src0_contig=1") != nullptr, "cuBLAS trace includes contiguity predicate");
+
     return 0;
 }

@@ -1627,6 +1627,32 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
     return compute_type;
 }
 
+static inline int ggml_cuda_cublas_route_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_CUBLAS_ROUTE_TRACE");
+        return s ? atoi(s) : 0;
+    }();
+
+    return value;
+}
+
+static inline void ggml_cuda_cublas_route_trace(const ggml_cuda_cublas_route_shape & shape) {
+    const int trace_limit = ggml_cuda_cublas_route_trace_limit();
+    if (trace_limit <= 0) {
+        return;
+    }
+
+    static std::atomic<int> trace_count{0};
+    const int trace_idx = trace_count.fetch_add(1, std::memory_order_relaxed);
+    if (trace_idx >= trace_limit) {
+        return;
+    }
+
+    char buf[320];
+    ggml_cuda_cublas_route_shape_format(buf, sizeof(buf), shape);
+    fprintf(stderr, "[LLAMA_CUBLAS_ROUTE] %s\n", buf);
+}
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -1662,7 +1688,22 @@ static void ggml_cuda_op_mul_mat_cublas(
         row_diff == src0->ne[1] &&
         dst->op_params[0] == GGML_PREC_DEFAULT;
 
-    if (supports_bf16 && src0->type == GGML_TYPE_NVFP4 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+    const bool src0_contig = ggml_is_contiguous(src0);
+    const bool full_rows = row_diff == src0->ne[1];
+    const bool fast_fp16 = fast_fp16_hardware_available(cc);
+    bool force_fp32 = false;
+    bool force_fp16 = false;
+    if (fast_fp16 && use_fp16) {
+        const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
+        force_fp32 = force_compute_type.fp32;
+        force_fp16 = force_compute_type.fp16;
+    }
+    ggml_cuda_cublas_route_trace(ggml_cuda_cublas_route_shape_make(
+        src0->type, src1->type, row_diff, src1_ncols, ne00, ne10, ldc,
+        supports_bf16, use_fp16, fast_fp16, force_fp32, force_fp16, src0_contig, full_rows,
+        GGML_CUDA_CC_IS_CDNA(cc), GGML_CUDA_CC_IS_RDNA4(cc), cc == GGML_CUDA_CC_VOLTA));
+
+    if (supports_bf16 && src0->type == GGML_TYPE_NVFP4 && src0_contig && full_rows) {
         // Paged prefill lever (patch 0033): NVFP4 only reaches cuBLAS when
         // ggml_cuda_should_use_mmq() returned false (large-M dense prefill).
         // Dequant the FP4 weights to a TRANSIENT bf16 pool buffer and run a
@@ -1702,7 +1743,7 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
-    } else if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+    } else if (supports_bf16 && src0->type == GGML_TYPE_BF16 && src0_contig && full_rows) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
@@ -1730,7 +1771,7 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
         to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
-    } else if (fast_fp16_hardware_available(cc) && use_fp16) {
+    } else if (fast_fp16 && use_fp16) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         if (src0->type != GGML_TYPE_F16) {
@@ -1754,12 +1795,10 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
 
-        const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
-
-        if (!force_compute_type.fp16 && (GGML_CUDA_CC_IS_CDNA(cc)
+        if (!force_fp16 && (GGML_CUDA_CC_IS_CDNA(cc)
                                         || GGML_CUDA_CC_IS_RDNA4(cc)
                                         || cc == GGML_CUDA_CC_VOLTA
-                                        || force_compute_type.fp32))
+                                        || force_fp32))
         {
             const float alpha = 1.0f;
             const float beta = 0.0f;
