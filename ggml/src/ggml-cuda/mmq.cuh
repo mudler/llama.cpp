@@ -3,10 +3,14 @@
 #include "common.cuh"
 #include "vecdotq.cuh"
 #include "mma.cuh"
+#include "mmq-shape-trace.h"
 
+#include <atomic>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 using namespace ggml_cuda_mma;
 
@@ -4163,6 +4167,18 @@ static inline int ggml_cuda_fp4_dense_mmq_x_cap() {
     return c;
 }
 
+static inline int ggml_cuda_moe_mmq_shape_trace_limit() {
+    static const int limit = []() -> int {
+        const char * s = getenv("LLAMA_MOE_MMQ_SHAPE_TRACE");
+        if (s == nullptr || strcmp(s, "0") == 0) {
+            return 0;
+        }
+        const int parsed = atoi(s);
+        return parsed > 0 ? parsed : 256;
+    }();
+    return limit;
+}
+
 template <ggml_type type>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id     = ggml_cuda_get_device();
@@ -4246,6 +4262,20 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
         if (ntiles_x < ntiles_x_best) {
             mmq_x_best = mmq_x;
             ntiles_x_best = ntiles_x;
+        }
+    }
+
+    if (args.expert_bounds != nullptr) {
+        static std::atomic<int> trace_count{0};
+        const int trace_limit = ggml_cuda_moe_mmq_shape_trace_limit();
+        const int trace_index = trace_limit > 0 ? trace_count.fetch_add(1, std::memory_order_relaxed) : trace_limit;
+        if (trace_index >= 0 && trace_index < trace_limit) {
+            char buf[256];
+            const ggml_cuda_mmq_shape shape = ggml_cuda_mmq_shape_make(
+                (int) type, true, args.ncols_dst, args.nchannels_x, args.ncols_max,
+                mmq_x_max, mmq_x_lim, mmq_x_best, mmq_y, args.use_stream_k);
+            ggml_cuda_mmq_shape_format(buf, sizeof(buf), shape);
+            fprintf(stderr, "[LLAMA_MOE_MMQ_SHAPE] %s\n", buf);
         }
     }
 
@@ -4341,4 +4371,3 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-
