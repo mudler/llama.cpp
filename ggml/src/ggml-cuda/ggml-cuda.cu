@@ -2685,6 +2685,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 }
 
+static inline int ggml_cuda_moe_mmid_route_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_MOE_MMID_ROUTE_TRACE");
+        return s ? atoi(s) : 0;
+    }();
+
+    return value;
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2697,13 +2706,30 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool src0_quantized = ggml_is_quantized(src0->type);
+    const int mmvq_mmid_max = src0_quantized ? get_mmvq_mmid_max_batch(src0->type, cc) : MMVQ_MAX_BATCH_SIZE;
+    const bool use_mmq = ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02);
+    const bool use_mmf = ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true);
+
+    const int mmid_trace_limit = ggml_cuda_moe_mmid_route_trace_limit();
+    if (mmid_trace_limit > 0) {
+        static std::atomic<int> trace_count{0};
+        const int trace_idx = trace_count.fetch_add(1, std::memory_order_relaxed);
+        if (trace_idx < mmid_trace_limit) {
+            const ggml_cuda_mmid_route_shape route_shape = ggml_cuda_mmid_route_shape_make(
+                src0->type, ne2, ne12, /*n_experts=*/ne02, mmvq_mmid_max, use_mmq, use_mmf,
+                GGML_CUDA_CC_IS_AMD(cc), src0_quantized);
+            char buf[256];
+            ggml_cuda_mmid_route_shape_format(buf, sizeof(buf), route_shape);
+            fprintf(stderr, "[LLAMA_MOE_MMID_ROUTE] %s\n", buf);
+        }
+    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+            if (src0_quantized) {
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
@@ -2716,12 +2742,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (use_mmq) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (use_mmf) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }

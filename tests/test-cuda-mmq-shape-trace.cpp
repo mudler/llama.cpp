@@ -118,5 +118,87 @@ int main() {
         ggml_cuda_mmq_small_m_shape_make(/* is_moe */ true, 4096, 256, 512, 128, true), 128, 16) == 128,
         "small-M tile override excludes prefill-like shapes");
 
+    const ggml_cuda_mmid_route_shape mmvq = ggml_cuda_mmid_route_shape_make(
+        /* type */ 39,
+        /* ne2 */ 1,
+        /* ne12 */ 1,
+        /* ne02 */ 256,
+        /* mmvq_max */ 4,
+        /* use_mmq */ true,
+        /* use_mmf */ true,
+        /* is_amd */ false,
+        /* is_quantized */ true);
+
+    require(mmvq.route == GGML_CUDA_MMID_ROUTE_MMVQ, "MMVQ wins when within its batch cap");
+    require(!mmvq.host_sync, "MMVQ route is graph-safe");
+
+    const ggml_cuda_mmid_route_shape mmq = ggml_cuda_mmid_route_shape_make(
+        /* type */ 39,
+        /* ne2 */ 128,
+        /* ne12 */ 128,
+        /* ne02 */ 256,
+        /* mmvq_max */ 4,
+        /* use_mmq */ true,
+        /* use_mmf */ true,
+        /* is_amd */ false,
+        /* is_quantized */ true);
+
+    require(mmq.route == GGML_CUDA_MMID_ROUTE_MMQ, "grouped MMQ wins after MMVQ cap");
+    require(!mmq.host_sync, "grouped MMQ route is graph-safe");
+
+    const ggml_cuda_mmid_route_shape mmf = ggml_cuda_mmid_route_shape_make(
+        /* type */ 1,
+        /* ne2 */ 128,
+        /* ne12 */ 128,
+        /* ne02 */ 256,
+        /* mmvq_max */ 4,
+        /* use_mmq */ false,
+        /* use_mmf */ true,
+        /* is_amd */ false,
+        /* is_quantized */ false);
+
+    require(mmf.route == GGML_CUDA_MMID_ROUTE_MMF, "MMF wins when grouped MMQ is unavailable");
+    require(!mmf.host_sync, "MMF route is graph-safe");
+
+    const ggml_cuda_mmid_route_shape fallback = ggml_cuda_mmid_route_shape_make(
+        /* type */ 0,
+        /* ne2 */ 128,
+        /* ne12 */ 128,
+        /* ne02 */ 256,
+        /* mmvq_max */ 4,
+        /* use_mmq */ false,
+        /* use_mmf */ false,
+        /* is_amd */ false,
+        /* is_quantized */ false);
+
+    require(fallback.route == GGML_CUDA_MMID_ROUTE_FALLBACK, "fallback is used when device routes do not match");
+    require(fallback.host_sync, "fallback route requires host synchronization");
+
+    const ggml_cuda_mmid_route_shape amd_mmvf = ggml_cuda_mmid_route_shape_make(
+        /* type */ 1,
+        /* ne2 */ 1,
+        /* ne12 */ 1,
+        /* ne02 */ 256,
+        /* mmvq_max */ 4,
+        /* use_mmq */ false,
+        /* use_mmf */ false,
+        /* is_amd */ true,
+        /* is_quantized */ false);
+
+    require(amd_mmvf.route == GGML_CUDA_MMID_ROUTE_MMVF, "AMD float vector route wins within MMVQ cap");
+    require(!amd_mmvf.host_sync, "AMD float vector route is graph-safe");
+
+    const int route_n = ggml_cuda_mmid_route_shape_format(buf, sizeof(buf), mmq);
+
+    require(route_n > 0, "MMID route format returns byte count");
+    require(std::strstr(buf, "route=mmq") != nullptr, "MMID trace includes route name");
+    require(std::strstr(buf, "host_sync=0") != nullptr, "MMID trace includes host sync flag");
+    require(std::strstr(buf, "ne2=128") != nullptr, "MMID trace includes destination batch");
+    require(std::strstr(buf, "ne12=128") != nullptr, "MMID trace includes routed token count");
+    require(std::strstr(buf, "n_experts=256") != nullptr, "MMID trace includes expert count");
+    require(std::strstr(buf, "mmvq_max=4") != nullptr, "MMID trace includes MMVQ cap");
+    require(std::strstr(buf, "use_mmq=1") != nullptr, "MMID trace includes MMQ predicate");
+    require(std::strstr(buf, "use_mmf=1") != nullptr, "MMID trace includes MMF predicate");
+
     return 0;
 }
