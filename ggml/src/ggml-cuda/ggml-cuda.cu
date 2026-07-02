@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/norm-bf16.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -1628,11 +1629,28 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
     return compute_type;
 }
 
+// [P1 bf16-stream] LLAMA_BF16_CUBLAS_F32_OUT plank. When set (by the bf16-stream
+// segment executor around an owned projection, or globally via the env), the cuBLAS
+// bf16/nvfp4 GEMM writes f32 directly from the bf16 tensor-core compute, skipping the
+// bf16 dst pool buffer + the bf16->f32 output convert_dtype. The result is the full
+// f32 GEMM accumulation (the current path rounds it to bf16 then widens back), so this
+// is a strictly-more-precise dtype change gated on the opt-in KL path, never md5.
+static thread_local bool g_bf16_stream_f32_out = false;
+static bool ggml_cuda_bf16_cublas_f32_out_env() {
+    static const bool e = [] {
+        const char * s = getenv("LLAMA_BF16_CUBLAS_F32_OUT");
+        return s != nullptr && atoi(s) != 0;
+    }();
+    return e;
+}
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream) {
+
+    const bool bf16_stream_f32_out = g_bf16_stream_f32_out || ggml_cuda_bf16_cublas_f32_out_env();
 
     GGML_ASSERT(src0_dd_i  != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
@@ -1686,23 +1704,34 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
         const nv_bfloat16 * src0_ptr = src0_as_bf16.get();
-        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
 
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
-                                 src1_ptr,       CUDA_R_16BF, ne10,
-                    &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-        to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        if (bf16_stream_f32_out) {
+            // [P1 bf16-stream] write f32 directly, skip the bf16 dst pool + convert.
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,  CUDA_R_16BF, ne00,
+                                     src1_ptr,  CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_dd_i,  CUDA_R_32F,  ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else {
+            ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
+                                     src1_ptr,       CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+            to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        }
     } else if (supports_bf16 && src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
         ggml_cuda_pool_alloc<nv_bfloat16> src1_as_bf16(ctx.pool(id));
         if (src1->type != GGML_TYPE_BF16) {
@@ -1714,23 +1743,34 @@ static void ggml_cuda_op_mul_mat_cublas(
         }
         const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
         const nv_bfloat16 * src0_ptr = (const nv_bfloat16 *)src0_dd_i;
-        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
 
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
-                                 src1_ptr,       CUDA_R_16BF, ne10,
-                    &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-        const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-        to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        if (bf16_stream_f32_out) {
+            // [P1 bf16-stream] write f32 directly, skip the bf16 dst pool + convert.
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,  CUDA_R_16BF, ne00,
+                                     src1_ptr,  CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_dd_i,  CUDA_R_32F,  ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        } else {
+            ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
+                                     src1_ptr,       CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+            to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        }
     } else if (fast_fp16_hardware_available(cc) && use_fp16) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
@@ -4704,6 +4744,215 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_pre_add_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
+    }
+
+    // [P1 bf16-stream] Generalized additive segment executor (LLAMA_BF16_STREAM=1,
+    // default off). ONE clause; the residual-stream segment is detected inside it.
+    // Owns any norm-producer whose consumers are ALL large-M cuBLAS-bf16 projections and
+    // runs that norm into a bf16 pool buffer so every projection reads the bf16
+    // activation directly - no per-op f32->bf16 convert_dtype glue. Two live q36 kinds:
+    //   * plain rms_norm+mul  {RMS_NORM,MUL}        -> BF16 q/k/v / GDN in_proj (may be
+    //                                                  multi-consumer: q,k,v share it)
+    //   * 0044 gated-DeltaNet output norm {SILU,RMS_NORM,MUL,MUL} -> ssm_out (the P0 seg)
+    // (The 0042 {ADD,RMS_NORM,MUL} residual-fused norm is handled by its f32 clause below
+    //  and, on q36, feeds the NVFP4-MMQ experts, so a bf16 stream there would bail; its
+    //  bf16 variant lives in norm-bf16.cu for op-set completeness.)
+    //
+    // Correctness: strict all-consumers-are-ours guard - the f32 norm output is never
+    // materialised, so every node that transitively reads it must be one of our owned
+    // projections (as src1); any other reader, or an unrelated compute node inside the
+    // skipped span, bails and the f32 fused-norm path runs unchanged. Each projection is
+    // executed inline through a bf16 view of the shared buffer; the whole owned span
+    // (norm nodes + intervening pure-view no-ops + the projections) is then skipped. The
+    // LLAMA_BF16_CUBLAS_F32_OUT plank additionally makes the owned projections write f32
+    // directly (skipping the dst convert). Env-off path and decode/small-M md5 untouched.
+    static const bool bf16_stream = [] {
+        const char * e = getenv("LLAMA_BF16_STREAM");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    static const int bf16_stream_trace = [] {
+        const char * e = getenv("LLAMA_BF16_STREAM_TRACE");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    static const bool bf16_stream_f32_out_default = [] {
+        const char * e = getenv("LLAMA_BF16_CUBLAS_F32_OUT");
+        return e == nullptr || atoi(e) != 0;   // plank ON by default when a segment engages
+    }();
+    if (bf16_stream) {
+        // ---- detect the norm-producer kind + the f32 activation tensor + node span ----
+        int           kind      = 0;     // 1=plain rms+mul, 2=gated-DeltaNet output norm
+        int           norm_span = 0;
+        const char *  seg_kind  = nullptr;
+        ggml_tensor * k_rms  = nullptr, * k_mul = nullptr, * k_silu = nullptr;
+        ggml_tensor * norm_out = nullptr;
+        if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL }, { GGML_UNARY_OP_SILU })) {
+            kind = 2; k_silu = cgraph->nodes[i]; k_rms = cgraph->nodes[i + 1]; k_mul = cgraph->nodes[i + 2];
+            norm_out = cgraph->nodes[i + 3]; norm_span = 4; seg_kind = "gate_norm";
+        } else if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+            kind = 1; k_rms = cgraph->nodes[i]; k_mul = cgraph->nodes[i + 1];
+            norm_out = cgraph->nodes[i + 1]; norm_span = 2; seg_kind = "rms_norm";
+        }
+
+        if (kind != 0) {
+            const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            const int norm_end  = i + norm_span;
+
+            // follow a pure view/reshape chain up to norm_out
+            auto roots_at = [](const ggml_tensor * t, const ggml_tensor * root) -> bool {
+                const ggml_tensor * c = t;
+                for (int d = 0; d < 8 && c != nullptr; ++d) {
+                    if (c == root) return true;
+                    if (c->view_src) { c = c->view_src; continue; }
+                    if ((c->op == GGML_OP_RESHAPE || c->op == GGML_OP_VIEW || c->op == GGML_OP_PERMUTE ||
+                         c->op == GGML_OP_TRANSPOSE || c->op == GGML_OP_CONT) && c->src[0]) { c = c->src[0]; continue; }
+                    break;
+                }
+                return false;
+            };
+            // Metadata-only no-ops (match the stock capture loop's skip set). CONT is
+            // NOT here: it materializes a contiguous copy, so a CONT of norm_out must fall
+            // through to the roots_at check below and bail (it would need the f32 norm).
+            auto is_pure_view = [](const ggml_tensor * t) -> bool {
+                return t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+                       t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
+            };
+            // ownable large-M cuBLAS-bf16 projection whose src1 is the FULL norm output
+            auto is_owned_proj = [&](const ggml_tensor * p) -> bool {
+                if (p->op != GGML_OP_MUL_MAT) return false;
+                const ggml_tensor * w  = p->src[0];
+                const ggml_tensor * x1 = p->src[1];
+                if (!w || !x1) return false;
+                if (!(x1 == norm_out || x1->view_src == norm_out ||
+                      (x1->op == GGML_OP_RESHAPE && x1->src[0] == norm_out))) return false;
+                if (ggml_nelements(x1) != ggml_nelements(norm_out)) return false;   // full, offset 0
+                return (w->type == GGML_TYPE_BF16 || w->type == GGML_TYPE_NVFP4) && ggml_is_contiguous(w) &&
+                       p->type == GGML_TYPE_F32 &&
+                       x1->ne[2] == 1 && x1->ne[3] == 1 &&
+                       x1->ne[1] >= 128 &&
+                       !ggml_cuda_fp4_prefill_should_engage(w, x1, const_cast<ggml_tensor *>(p), cc) &&
+                       !ggml_cuda_should_use_mmq(w->type, cc, x1->ne[1], /*n_experts=*/0);
+            };
+
+            // Scan the rest of the graph: collect our projections, enforce that every
+            // consumer of norm_out is one of them, and that the skipped span holds only
+            // pure views / our projections.
+            bool          ok           = true;
+            int           n_proj       = 0;
+            int           max_proj_idx = -1;
+            const char *  miss_reason  = "unknown";
+            int           miss_node    = -1;
+            const char *  miss_op      = "";
+            ggml_tensor * projs[16];
+            for (int j = norm_end; j < cgraph->n_nodes && ok; ++j) {
+                ggml_tensor * nj = cgraph->nodes[j];
+                // Pure view/reshape no-ops are part of the src1 view chain (or unrelated
+                // metadata ops): they carry no kernel and are re-expressed by the inline
+                // bf16 src1, so they never force f32 materialization. A *real* downstream
+                // consumer that reads norm_out through such a view is still caught below,
+                // because roots_at() climbs the view chain to norm_out.
+                if (is_pure_view(nj)) {
+                    continue;
+                }
+                if (is_owned_proj(nj)) {
+                    if (n_proj < 16) { projs[n_proj] = nj; }
+                    n_proj++;
+                    max_proj_idx = j;
+                    continue;
+                }
+                // any (non-view, non-projection) reader of norm_out disqualifies the segment
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (nj->src[s] && roots_at(nj->src[s], norm_out)) {
+                        ok = false; miss_reason = "nonproj_consumer"; miss_node = j; miss_op = ggml_op_name(nj->op); break;
+                    }
+                }
+            }
+            // require projections, room in the fixed buffer, and a bounded span. The
+            // span [norm_end, max_proj_idx] may hold non-projection compute (q36 QK-norm /
+            // scale on the projection outputs); those never read norm_out (enforced above)
+            // so the whole span is executed inline in graph order below - owned projections
+            // through the bf16 buffer, everything else via the stock per-node executor -
+            // and then skipped as one unit.
+            const int span_len = max_proj_idx - norm_end;
+            if (!(n_proj >= 1 && n_proj <= 16 && span_len <= 96)) {
+                if (ok) { miss_reason = (n_proj == 0) ? "no_owned_proj" : (n_proj > 16 ? "too_many_proj" : "span_too_long"); }
+                ok = false;
+            }
+
+            if (ok) {
+                const int64_t ne_tot = ggml_nelements(norm_out);
+                ggml_cuda_pool_alloc<nv_bfloat16> norm_bf16(cuda_ctx->pool(), ne_tot);
+                if (kind == 2) {
+                    ggml_cuda_rms_norm_gate_mul_bf16out(*cuda_ctx, k_rms, k_mul, k_silu, norm_out, norm_bf16.get());
+                } else {
+                    ggml_cuda_rms_norm_mul_bf16out(*cuda_ctx, k_rms, k_mul, norm_bf16.get());
+                }
+
+                // Execute the whole owned span inline, in graph order (mirrors the stock
+                // capture loop's per-node handling for the non-owned nodes).
+                for (int j = norm_end; j <= max_proj_idx; ++j) {
+                    ggml_tensor * nj = cgraph->nodes[j];
+
+                    bool mine = false;
+                    for (int p = 0; p < n_proj; ++p) { if (projs[p] == nj) { mine = true; break; } }
+
+                    if (mine) {
+                        ggml_tensor * proj_src1 = nj->src[1];
+                        ggml_tensor   src1_bf16 = *proj_src1;
+                        src1_bf16.type      = GGML_TYPE_BF16;
+                        src1_bf16.data      = norm_bf16.get();
+                        src1_bf16.view_src  = nullptr;
+                        src1_bf16.view_offs = 0;
+                        src1_bf16.nb[0]     = sizeof(nv_bfloat16);
+                        src1_bf16.nb[1]     = src1_bf16.nb[0] * src1_bf16.ne[0];
+                        src1_bf16.nb[2]     = src1_bf16.nb[1] * src1_bf16.ne[1];
+                        src1_bf16.nb[3]     = src1_bf16.nb[2] * src1_bf16.ne[2];
+
+                        ggml_tensor * saved_src1 = nj->src[1];
+                        nj->src[1] = &src1_bf16;
+                        g_bf16_stream_f32_out = bf16_stream_f32_out_default;
+                        const bool okc = ggml_cuda_compute_forward(*cuda_ctx, nj);
+                        g_bf16_stream_f32_out = false;
+                        nj->src[1] = saved_src1;
+                        GGML_ASSERT(okc);
+                        continue;
+                    }
+
+                    // non-owned span node: mirror the stock loop (skip metadata no-ops,
+                    // run the rest through the per-node executor)
+                    if (ggml_is_empty(nj) || nj->op == GGML_OP_RESHAPE || nj->op == GGML_OP_TRANSPOSE ||
+                        nj->op == GGML_OP_VIEW || nj->op == GGML_OP_PERMUTE || nj->op == GGML_OP_NONE) {
+                        continue;
+                    }
+                    if ((nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                        continue;
+                    }
+                    const bool okn = ggml_cuda_compute_forward(*cuda_ctx, nj);
+                    GGML_ASSERT(okn);
+                }
+
+                static std::atomic<int> bf16_stream_engage_count{0};
+                const int ec = bf16_stream_engage_count.fetch_add(1, std::memory_order_relaxed);
+                if (bf16_stream_trace > 0 && ec < bf16_stream_trace) {
+                    const ggml_tensor * w0 = projs[0]->src[0];
+                    fprintf(stderr,
+                        "[LLAMA_BF16_STREAM] engaged seg=%s node=%d n_proj=%d last_proj=%d "
+                        "M=%" PRId64 " N=%" PRId64 " K=%" PRId64 " f32out=%d skip=%d\n",
+                        seg_kind, i, n_proj, max_proj_idx, projs[0]->src[1]->ne[1], w0->ne[1], w0->ne[0],
+                        bf16_stream_f32_out_default ? 1 : 0, max_proj_idx - i);
+                }
+                return max_proj_idx - i;   // skip norm nodes + intervening views + all owned projections
+            }
+
+            if (bf16_stream_trace > 0) {
+                static std::atomic<int> bf16_stream_miss_count{0};
+                const int mc = bf16_stream_miss_count.fetch_add(1, std::memory_order_relaxed);
+                if (mc < bf16_stream_trace) {
+                    fprintf(stderr,
+                        "[LLAMA_BF16_STREAM] miss seg=%s node=%d n_proj=%d reason=%s miss_node=%d miss_op=%s\n",
+                        seg_kind, i, n_proj, miss_reason, miss_node, miss_op);
+                }
+            }
+        }
     }
 
     // Fused gated RMS norm: RMS norm + weight multiply + SiLU-gated multiply
