@@ -528,11 +528,16 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
     }
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+    // [P1 bf16-stream] bf16 is accepted so a bf16-resident attention segment can rope
+    // its Q/K in bf16 (the norm/neox kernels are float-internal, so the bf16 arms just
+    // add T/D = nv_bfloat16 instantiations below).
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
     // When not fused, src0 and dst types must match
     // When fused (ROPE+VIEW+SET_ROWS), src0 may be F32 and dst may be F16
-    GGML_ASSERT(src0->type == dst->type || (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16));
+    GGML_ASSERT(src0->type == dst->type ||
+                (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) ||
+                (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16));
 
     const int64_t ne00 = src0->ne[0]; // head dims
     const int64_t ne01 = src0->ne[1]; // num heads
@@ -610,6 +615,16 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                                                 s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                 ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
                                                 set_rows_stride, stream);
+        } else if (src0->type == GGML_TYPE_BF16 && dst_type == GGML_TYPE_BF16) {
+            rope_neox_cuda<forward, nv_bfloat16, nv_bfloat16>((const nv_bfloat16 *) src0_d, (nv_bfloat16 *) dst_d, ne00, ne01, ne02, s01, s02,
+                                                s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
+                                                ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
+                                                set_rows_stride, stream);
+        } else if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_BF16) {
+            rope_neox_cuda<forward, float, nv_bfloat16>((const float *) src0_d, (nv_bfloat16 *) dst_d, ne00, ne01, ne02, s01, s02,
+                                                s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
+                                                ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
+                                                set_rows_stride, stream);
         } else {
             GGML_ABORT("fatal error");
         }
@@ -650,6 +665,16 @@ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                                                  set_rows_stride, stream);
         } else if (src0->type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F16) {
             rope_norm_cuda<forward, half, half>((const half *) src0_d, (half *) dst_d, ne00, ne01, ne02, s01, s02,
+                                                s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
+                                                ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
+                                                set_rows_stride, stream);
+        } else if (src0->type == GGML_TYPE_BF16 && dst_type == GGML_TYPE_BF16) {
+            rope_norm_cuda<forward, nv_bfloat16, nv_bfloat16>((const nv_bfloat16 *) src0_d, (nv_bfloat16 *) dst_d, ne00, ne01, ne02, s01, s02,
+                                                s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
+                                                ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
+                                                set_rows_stride, stream);
+        } else if (src0->type == GGML_TYPE_F32 && dst_type == GGML_TYPE_BF16) {
+            rope_norm_cuda<forward, float, nv_bfloat16>((const float *) src0_d, (nv_bfloat16 *) dst_d, ne00, ne01, ne02, s01, s02,
                                                 s03, s1, s2, s3, n_dims, nr, pos, freq_scale, freq_base,
                                                 ext_factor, attn_factor, corr_dims, freq_factors, row_indices,
                                                 set_rows_stride, stream);
