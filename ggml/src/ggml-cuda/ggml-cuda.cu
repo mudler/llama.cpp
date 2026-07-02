@@ -32,6 +32,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/moe-ffn.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -2854,7 +2855,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
-static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -4032,6 +4033,201 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+static inline const char * ggml_cuda_moe_wp_trace_tensor_name(const ggml_tensor * t) {
+    return t != nullptr && t->name[0] != '\0' ? t->name : "-";
+}
+
+static inline int ggml_cuda_moe_whole_pattern_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_MOE_WHOLE_PATTERN_TRACE");
+        if (s == nullptr || strcmp(s, "0") == 0) {
+            return 0;
+        }
+        const int parsed = atoi(s);
+        return parsed > 0 ? parsed : 128;
+    }();
+
+    return value;
+}
+
+static inline bool ggml_cuda_moe_whole_pattern_trace_take(std::atomic<int> & counter) {
+    const int trace_limit = ggml_cuda_moe_whole_pattern_trace_limit();
+    if (trace_limit <= 0) {
+        return false;
+    }
+
+    const int trace_idx = counter.fetch_add(1, std::memory_order_relaxed);
+    return trace_idx < trace_limit;
+}
+
+static inline int ggml_cuda_moe_whole_pattern_early_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_MOE_WHOLE_PATTERN_EARLY_TRACE");
+        if (s == nullptr || strcmp(s, "0") == 0) {
+            return 0;
+        }
+        const int parsed = atoi(s);
+        return parsed > 0 ? parsed : 128;
+    }();
+
+    return value;
+}
+
+static inline bool ggml_cuda_moe_whole_pattern_exec_enabled() {
+    static const bool value = []() {
+        const char * s = getenv("LLAMA_MOE_WHOLE_PATTERN_EXEC");
+        return s != nullptr && atoi(s) != 0;
+    }();
+
+    return value;
+}
+
+static inline int ggml_cuda_moe_whole_pattern_exec_trace_limit() {
+    static const int value = []() {
+        const char * s = getenv("LLAMA_MOE_WHOLE_PATTERN_EXEC_TRACE");
+        if (s == nullptr || strcmp(s, "0") == 0) {
+            return 0;
+        }
+        const int parsed = atoi(s);
+        return parsed > 0 ? parsed : 128;
+    }();
+
+    return value;
+}
+
+static inline bool ggml_cuda_moe_whole_pattern_exec_trace_take(std::atomic<int> & counter) {
+    const int trace_limit = ggml_cuda_moe_whole_pattern_exec_trace_limit();
+    if (trace_limit <= 0) {
+        return false;
+    }
+
+    const int trace_idx = counter.fetch_add(1, std::memory_order_relaxed);
+    return trace_idx < trace_limit;
+}
+
+struct ggml_cuda_moe_whole_pattern {
+    const ggml_tensor * gate_up = nullptr;
+    const ggml_tensor * gate    = nullptr;
+    const ggml_tensor * up      = nullptr;
+    const ggml_tensor * glu     = nullptr;
+    const ggml_tensor * down    = nullptr;
+    const ggml_tensor * ids     = nullptr;
+
+    bool view_pair      = false;
+    bool ids_match      = false;
+    bool swiglu         = false;
+    bool supported_type = false;
+    bool supported      = false;
+};
+
+static ggml_cuda_moe_whole_pattern ggml_cuda_moe_whole_pattern_detect(const ggml_tensor * glu, const ggml_tensor * down) {
+    ggml_cuda_moe_whole_pattern pattern{};
+    pattern.glu  = glu;
+    pattern.down = down;
+
+    if (glu == nullptr || down == nullptr || glu->op != GGML_OP_GLU || down->op != GGML_OP_MUL_MAT_ID) {
+        return pattern;
+    }
+
+    pattern.gate = glu->src[0];
+    pattern.up   = glu->src[1];
+    pattern.ids  = down->src[2];
+
+    pattern.view_pair = pattern.gate != nullptr && pattern.up != nullptr &&
+                        pattern.gate->op == GGML_OP_VIEW && pattern.up->op == GGML_OP_VIEW &&
+                        pattern.gate->view_src != nullptr && pattern.gate->view_src == pattern.up->view_src;
+    if (!pattern.view_pair) {
+        return pattern;
+    }
+
+    pattern.gate_up = pattern.gate->view_src;
+    if (pattern.gate_up == nullptr || pattern.gate_up->op != GGML_OP_MUL_MAT_ID) {
+        return pattern;
+    }
+
+    pattern.ids_match      = pattern.gate_up->src[2] == pattern.ids;
+    pattern.swiglu         = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU;
+    pattern.supported_type = down->src[0] != nullptr &&
+                             (down->src[0]->type == GGML_TYPE_NVFP4 || down->src[0]->type == GGML_TYPE_MXFP4);
+    pattern.supported      = pattern.ids_match && pattern.swiglu && pattern.supported_type;
+
+    return pattern;
+}
+
+static ggml_cuda_moe_whole_pattern ggml_cuda_moe_whole_pattern_detect_early(const ggml_cgraph * cgraph, int i) {
+    ggml_cuda_moe_whole_pattern pattern{};
+
+    if (cgraph == nullptr || i + 4 >= cgraph->n_nodes) {
+        return pattern;
+    }
+
+    const ggml_tensor * gate_up = cgraph->nodes[i + 0];
+    const ggml_tensor * view0   = cgraph->nodes[i + 1];
+    const ggml_tensor * view1   = cgraph->nodes[i + 2];
+    const ggml_tensor * glu     = cgraph->nodes[i + 3];
+    const ggml_tensor * down    = cgraph->nodes[i + 4];
+
+    pattern.gate_up = gate_up;
+    pattern.glu     = glu;
+    pattern.down    = down;
+
+    if (gate_up == nullptr || view0 == nullptr || view1 == nullptr || glu == nullptr || down == nullptr ||
+        gate_up->op != GGML_OP_MUL_MAT_ID || view0->op != GGML_OP_VIEW || view1->op != GGML_OP_VIEW ||
+        glu->op != GGML_OP_GLU || down->op != GGML_OP_MUL_MAT_ID) {
+        return pattern;
+    }
+
+    pattern.view_pair = view0->view_src == gate_up && view1->view_src == gate_up;
+    if (!pattern.view_pair) {
+        return pattern;
+    }
+
+    if (glu->src[0] == view0 && glu->src[1] == view1) {
+        pattern.gate = view0;
+        pattern.up   = view1;
+    } else if (glu->src[0] == view1 && glu->src[1] == view0) {
+        pattern.gate = view1;
+        pattern.up   = view0;
+    } else {
+        return pattern;
+    }
+
+    if (down->src[1] != glu) {
+        return pattern;
+    }
+
+    pattern.ids            = down->src[2];
+    pattern.ids_match      = gate_up->src[2] == pattern.ids;
+    pattern.swiglu         = ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU;
+    pattern.supported_type = down->src[0] != nullptr &&
+                             (down->src[0]->type == GGML_TYPE_NVFP4 || down->src[0]->type == GGML_TYPE_MXFP4);
+    pattern.supported      = pattern.ids_match && pattern.swiglu && pattern.supported_type;
+
+    return pattern;
+}
+
+static bool ggml_cuda_moe_whole_pattern_exec_proof(
+        ggml_backend_cuda_context * cuda_ctx,
+        const ggml_cuda_moe_whole_pattern & pattern) {
+    GGML_ASSERT(cuda_ctx != nullptr);
+    GGML_ASSERT(pattern.supported);
+    GGML_ASSERT(pattern.gate_up != nullptr);
+    GGML_ASSERT(pattern.glu != nullptr);
+    GGML_ASSERT(pattern.down != nullptr);
+
+    if (!ggml_cuda_compute_forward(*cuda_ctx, const_cast<ggml_tensor *>(pattern.gate_up))) {
+        return false;
+    }
+    if (!ggml_cuda_compute_forward(*cuda_ctx, const_cast<ggml_tensor *>(pattern.glu))) {
+        return false;
+    }
+    if (!ggml_cuda_compute_forward(*cuda_ctx, const_cast<ggml_tensor *>(pattern.down))) {
+        return false;
+    }
+
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4041,6 +4237,112 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    static std::atomic<int> moe_whole_pattern_early_trace_count{0};
+    const bool routed_ffn_poc = ggml_cuda_moe_routed_ffn_poc_enabled();
+    const bool whole_pattern_exec = ggml_cuda_moe_whole_pattern_exec_enabled();
+    const int whole_pattern_early_trace_limit = ggml_cuda_moe_whole_pattern_early_trace_limit();
+    if (node->op == GGML_OP_MUL_MAT_ID &&
+            (routed_ffn_poc || whole_pattern_exec || whole_pattern_early_trace_limit > 0)) {
+        const ggml_cuda_moe_whole_pattern pattern = ggml_cuda_moe_whole_pattern_detect_early(cgraph, i);
+        if (pattern.view_pair) {
+            const int trace_idx = moe_whole_pattern_early_trace_count.fetch_add(1, std::memory_order_relaxed);
+            if (trace_idx < whole_pattern_early_trace_limit) {
+                const ggml_tensor * down_w = pattern.down != nullptr ? pattern.down->src[0] : nullptr;
+                const ggml_tensor * down_x = pattern.down != nullptr ? pattern.down->src[1] : nullptr;
+                fprintf(stderr,
+                    "[LLAMA_MOE_WHOLE_PATTERN_EARLY] supported=%d skip_ready=%d gate_up=%s gate=%s up=%s glu=%s down=%s ids=%s type=%s"
+                    " n_tokens=%" PRId64 " n_used=%" PRId64 " experts=%" PRId64
+                    " n_embd=%" PRId64 " n_ff=%" PRId64
+                    " ids_match=%d swiglu=%d\n",
+                    pattern.supported ? 1 : 0,
+                    pattern.supported ? 4 : 0,
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.gate_up),
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.gate),
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.up),
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.glu),
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.down),
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.ids),
+                    down_w != nullptr ? ggml_type_name(down_w->type) : "-",
+                    down_x != nullptr ? down_x->ne[2] : 0,
+                    pattern.ids != nullptr ? pattern.ids->ne[0] : 0,
+                    down_w != nullptr ? down_w->ne[2] : 0,
+                    down_w != nullptr ? down_w->ne[1] : 0,
+                    down_w != nullptr ? down_w->ne[0] : 0,
+                    pattern.ids_match ? 1 : 0,
+                    pattern.swiglu ? 1 : 0);
+            }
+        }
+
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const bool poc_supported = routed_ffn_poc && ggml_cuda_moe_routed_ffn_poc_should_engage(
+            pattern.gate_up, pattern.gate, pattern.up, pattern.glu, pattern.down, pattern.ids, cc);
+
+        if ((poc_supported || (whole_pattern_exec && pattern.supported))) {
+            const bool ok = poc_supported ?
+                ggml_cuda_moe_routed_ffn_poc(
+                    *cuda_ctx,
+                    const_cast<ggml_tensor *>(pattern.gate_up),
+                    const_cast<ggml_tensor *>(pattern.gate),
+                    const_cast<ggml_tensor *>(pattern.up),
+                    const_cast<ggml_tensor *>(pattern.glu),
+                    const_cast<ggml_tensor *>(pattern.down)) :
+                ggml_cuda_moe_whole_pattern_exec_proof(cuda_ctx, pattern);
+            GGML_ASSERT(ok);
+
+            static std::atomic<int> moe_whole_pattern_exec_trace_count{0};
+            if (ggml_cuda_moe_whole_pattern_exec_trace_take(moe_whole_pattern_exec_trace_count)) {
+                const ggml_tensor * down_w = pattern.down != nullptr ? pattern.down->src[0] : nullptr;
+                const ggml_tensor * down_x = pattern.down != nullptr ? pattern.down->src[1] : nullptr;
+                fprintf(stderr,
+                    "[LLAMA_MOE_WHOLE_PATTERN_EXEC] skip=4 gate_up=%s glu=%s down=%s ids=%s"
+                    " n_tokens=%" PRId64 " n_used=%" PRId64 " experts=%" PRId64 "\n",
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.gate_up),
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.glu),
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.down),
+                    ggml_cuda_moe_wp_trace_tensor_name(pattern.ids),
+                    down_x != nullptr ? down_x->ne[2] : 0,
+                    pattern.ids != nullptr ? pattern.ids->ne[0] : 0,
+                    down_w != nullptr ? down_w->ne[2] : 0);
+            }
+
+            return 4;
+        }
+    }
+
+    if (node->op == GGML_OP_GLU && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID) {
+        static std::atomic<int> moe_whole_pattern_trace_count{0};
+        const bool whole_trace = ggml_cuda_moe_whole_pattern_trace_take(moe_whole_pattern_trace_count);
+
+        if (whole_trace) {
+            const ggml_tensor * down = cgraph->nodes[i + 1];
+            const ggml_cuda_moe_whole_pattern pattern = ggml_cuda_moe_whole_pattern_detect(node, down);
+
+            const ggml_tensor * down_w = pattern.down != nullptr ? pattern.down->src[0] : nullptr;
+            const ggml_tensor * down_x = pattern.down != nullptr ? pattern.down->src[1] : nullptr;
+            fprintf(stderr,
+                "[LLAMA_MOE_WHOLE_PATTERN] supported=%d gate_up=%s gate=%s up=%s glu=%s down=%s ids=%s type=%s"
+                " n_tokens=%" PRId64 " n_used=%" PRId64 " experts=%" PRId64
+                " n_embd=%" PRId64 " n_ff=%" PRId64
+                " view_pair=%d ids_match=%d swiglu=%d\n",
+                pattern.supported ? 1 : 0,
+                ggml_cuda_moe_wp_trace_tensor_name(pattern.gate_up),
+                ggml_cuda_moe_wp_trace_tensor_name(pattern.gate),
+                ggml_cuda_moe_wp_trace_tensor_name(pattern.up),
+                ggml_cuda_moe_wp_trace_tensor_name(pattern.glu),
+                ggml_cuda_moe_wp_trace_tensor_name(pattern.down),
+                ggml_cuda_moe_wp_trace_tensor_name(pattern.ids),
+                down_w != nullptr ? ggml_type_name(down_w->type) : "-",
+                down_x != nullptr ? down_x->ne[2] : 0,
+                pattern.ids != nullptr ? pattern.ids->ne[0] : 0,
+                down_w != nullptr ? down_w->ne[2] : 0,
+                down_w != nullptr ? down_w->ne[1] : 0,
+                down_w != nullptr ? down_w->ne[0] : 0,
+                pattern.view_pair ? 1 : 0,
+                pattern.ids_match ? 1 : 0,
+                pattern.swiglu ? 1 : 0);
+        }
+    }
 
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||

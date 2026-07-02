@@ -4334,6 +4334,31 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
+struct ggml_cuda_mmq_ids_meta {
+    ggml_cuda_pool_alloc<int32_t> ids_src1;
+    ggml_cuda_pool_alloc<int32_t> ids_dst;
+    ggml_cuda_pool_alloc<int32_t> expert_bounds;
+
+    int64_t ne_get_rows = 0;
+
+    ggml_cuda_mmq_ids_meta() = default;
+    ggml_cuda_mmq_ids_meta(ggml_cuda_pool & pool, int64_t ne_get_rows, int64_t n_experts);
+
+    void alloc(ggml_cuda_pool & pool, int64_t ne_get_rows, int64_t n_experts);
+
+    void build(
+        const ggml_tensor * ids, int64_t n_experts, int64_t n_tokens,
+        int64_t n_expert_used, int64_t nchannels_y, int64_t sis1,
+        cudaStream_t stream);
+};
+
+void ggml_cuda_mul_mat_q_moe_quantized(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * src0, const void * src1_q, ggml_tensor * dst,
+    const int32_t * ids_dst, const int32_t * expert_bounds,
+    int64_t n_tokens, int64_t n_expert_used, int64_t n_experts,
+    int64_t ncols_src1_padded);
+
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
